@@ -1,0 +1,9 @@
+# Python virtual environment (shared by backend)
+.venv/
+__pycache__/
+*.pyc
+
+# editor
+.vscode/
+
+# backend/.gitignore and frontend/.gitignore hold the rules for each part

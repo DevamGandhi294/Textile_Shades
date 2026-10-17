@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# files the tools write
+outputs/
+research/
+
+# Full-precision model and its sources (172 MB, too big for GitHub; see README "Faster model").
+# The small int8 model in models/ IS uploaded.
+models/manga_line_extraction.onnx
+mle/
+*.pth
