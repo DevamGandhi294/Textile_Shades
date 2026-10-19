@@ -27,13 +27,16 @@ from dataclasses import asdict
 from pathlib import Path
 
 import cv2
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from PIL import Image, ImageOps
 from pydantic import BaseModel
 
 from sketchclean import CleanSettings, EvenSettings, OutputSettings, Session, Settings
 from sketchclean import ai
+import perfect
 
 MAX_UPLOAD_MB = 20
 MAX_SESSIONS = 20                    # each one holds a few full-size images in memory
@@ -89,6 +92,7 @@ class Entry:
         self.sess, self.folder, self.stem = sess, folder, stem
         self.lock = threading.Lock()         # one change at a time per image
         self.used = time.time()
+        self.perfect = None                  # PNG from "Make border perfect" (cleared when settings change)
 
 
 _sessions: "OrderedDict[str, Entry]" = OrderedDict()
@@ -171,7 +175,7 @@ app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["*"], a
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "ai": ai.available(), "ai_status": ai.status(),
+    return {"ok": True, "ai": ai.available(), "ai_status": ai.status(), "perfect": perfect.available(),
             "defaults": asdict(Settings())}
 
 
@@ -214,11 +218,39 @@ def update_session(sid: str, settings: SettingsIn):
         return _result(sid, entry)
 
 
+@app.post("/api/sessions/{sid}/perfect")
+def make_perfect(sid: str, source: str = "sketch"):
+    """'Make border perfect': OpenAI gpt-image-1 (medium) redraws the design as clean line art.
+    source=sketch sends the original uploaded photo; source=color sends the scanned image (checkpoint 1)."""
+    if source not in ("sketch", "color"):
+        raise HTTPException(422, "source must be 'sketch' or 'color'")
+    entry = _get(sid)
+    with entry.lock:
+        s = entry.sess
+        if source == "sketch":
+            picture = np.asarray(ImageOps.exif_transpose(Image.open(s.path)).convert("RGB"))
+        else:
+            picture = s.preview_scan()
+        try:
+            rgb = perfect.make_perfect(picture, source, s.settings.output.color)
+        except perfect.PerfectError as e:
+            raise HTTPException(502, str(e))
+        path = entry.folder / f"{entry.stem}_perfect.png"
+        dpi = s.settings.output.dpi
+        Image.fromarray(rgb, "RGB").save(path, dpi=(dpi, dpi))
+        entry.perfect = path
+        return {"image": _data_url(rgb)}
+
+
 @app.get("/api/sessions/{sid}/download")
 def download(sid: str, fmt: str = "zip"):
     """One file (png, pdf, svg, eps, dxf, tiff, bmp) or everything in one zip."""
     entry = _get(sid)
     fmt = fmt.lower()
+    if fmt == "perfect":
+        if entry.perfect is None or not entry.perfect.exists():
+            raise HTTPException(404, "Press Make border perfect first.")
+        return FileResponse(entry.perfect, filename=entry.perfect.name)
     if fmt not in ("zip",) + ALL_FORMATS:
         raise HTTPException(422, f"Unknown format: {fmt}")
     with entry.lock:
@@ -230,6 +262,8 @@ def download(sid: str, fmt: str = "zip"):
             with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
                 for f in files.values():
                     z.write(f, Path(f).name)
+                if entry.perfect is not None and entry.perfect.exists():
+                    z.write(entry.perfect, entry.perfect.name)
             return FileResponse(bundle, filename=bundle.name, media_type="application/zip")
         if fmt not in files:
             failed = entry.sess.report().get("failed_formats", {})

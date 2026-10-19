@@ -1,38 +1,30 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { ChevronDown, RotateCcw, X } from "lucide-react";
+import { RotateCcw, X } from "lucide-react";
 
-// ------------------------------------------------------------------ sidebar controls (dark background)
+// ------------------------------------------------------------------ settings panel controls
 
-/** Bordered box that groups a few controls, like the panels in the Python app. */
-export function Group({ children }: { children: React.ReactNode }) {
-  return <div className="flex flex-col gap-4 rounded-lg border border-white/15 bg-white/5 p-3">{children}</div>;
-}
-
-/** Section that opens and closes ("2 · Clean the lines"). */
-export function Accordion({ title, open, children }: { title: string; open?: boolean; children: React.ReactNode }) {
+/** A titled block of settings, separated from the next by a thin line. */
+export function Section({ title, children }: { title?: string; children: React.ReactNode }) {
   return (
-    <details open={open} className="group rounded-lg border border-white/15 bg-white/5">
-      <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-3 py-2.5 font-semibold text-white [&::-webkit-details-marker]:hidden">
-        {title}
-        <ChevronDown className="h-5 w-5 shrink-0 transition-transform group-open:rotate-180" aria-hidden />
-      </summary>
-      <div className="flex flex-col gap-4 border-t border-white/15 p-3">{children}</div>
-    </details>
+    <section className="flex flex-col gap-5 border-b border-line py-5 first:pt-0 last:border-b-0">
+      {title && <h3 className="text-xs font-bold tracking-widest text-brand uppercase">{title}</h3>}
+      {children}
+    </section>
   );
 }
 
 function Label({ label, info }: { label: string; info?: string }) {
   return (
     <>
-      <span className="font-semibold text-white">{label}</span>
-      {info && <span className="text-sm leading-snug text-white/75">{info}</span>}
+      <span className="font-semibold text-ink">{label}</span>
+      {info && <span className="text-sm leading-relaxed text-muted">{info}</span>}
     </>
   );
 }
 
-/** One choice out of a few, shown as round radio buttons. */
+/** One choice out of a few, shown as full-width rows with a round marker. */
 export function Radio<T extends string | number>({
   label,
   info,
@@ -43,7 +35,7 @@ export function Radio<T extends string | number>({
 }: {
   label: string;
   info?: string;
-  options: { label: string; value: T }[];
+  options: { label: string; hint?: string; value: T }[];
   value: T;
   onChange: (v: T) => void;
   disabled?: boolean;
@@ -53,24 +45,27 @@ export function Radio<T extends string | number>({
       <legend className="contents">
         <Label label={label} info={info} />
       </legend>
-      <div className="mt-1.5 flex flex-wrap gap-2">
+      <div className="mt-2 flex flex-col gap-2">
         {options.map((o) => {
           const on = o.value === value;
           return (
             <label
               key={String(o.value)}
-              className={`relative flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium text-white transition has-disabled:cursor-not-allowed has-disabled:opacity-50 ${
-                on ? "border-mint bg-white/15" : "border-white/20 hover:bg-white/10"
+              className={`relative flex cursor-pointer items-center gap-3 rounded-xl border px-4 py-3 transition has-disabled:cursor-not-allowed has-disabled:opacity-50 ${
+                on ? "border-brand bg-mint-soft" : "border-line bg-white hover:bg-gray-50"
               }`}
             >
               <input type="radio" checked={on} onChange={() => onChange(o.value)} className="sr-only" />
               <span
-                className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2 ${on ? "border-mint" : "border-white/50"}`}
+                className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 ${on ? "border-btn" : "border-gray-300"}`}
                 aria-hidden
               >
-                {on && <span className="h-2 w-2 rounded-full bg-mint" />}
+                {on && <span className="h-2.5 w-2.5 rounded-full bg-btn" />}
               </span>
-              {o.label}
+              <span>
+                {o.label}
+                {o.hint && <span className="ml-1 text-btn">{o.hint}</span>}
+              </span>
             </label>
           );
         })}
@@ -94,15 +89,15 @@ export function Checkbox({
   disabled?: boolean;
 }) {
   return (
-    <label className="flex cursor-pointer gap-2.5 has-disabled:cursor-not-allowed has-disabled:opacity-50">
+    <label className="flex cursor-pointer gap-3 has-disabled:cursor-not-allowed has-disabled:opacity-50">
       <input
         type="checkbox"
         checked={checked}
         disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
-        className="mt-0.5 h-5 w-5 shrink-0 cursor-pointer accent-mint"
+        className="mt-0.5 h-5 w-5 shrink-0 cursor-pointer accent-btn"
       />
-      <span className="flex flex-col">
+      <span className="flex flex-col gap-0.5">
         <Label label={label} info={info} />
       </span>
     </label>
@@ -140,10 +135,10 @@ export function SliderRow({
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-start justify-between gap-3">
-        <span className="flex flex-col">
+        <span className="flex flex-col gap-0.5">
           <Label label={label} info={info} />
         </span>
-        <span className="flex shrink-0 overflow-hidden rounded-md border border-white/25">
+        <span className="flex shrink-0 overflow-hidden rounded-lg border border-line">
           <input
             type="number"
             aria-label={label}
@@ -155,7 +150,7 @@ export function SliderRow({
             onChange={(e) => onChange(Number(e.target.value))}
             onBlur={(e) => onCommit(clamp(Number(e.target.value) || 0))}
             onKeyDown={(e) => e.key === "Enter" && onCommit(clamp(Number(e.currentTarget.value) || 0))}
-            className="h-9 w-16 bg-white/10 px-2 text-center text-sm text-white disabled:opacity-50"
+            className="h-9 w-16 bg-white px-2 text-center text-sm disabled:opacity-50"
           />
           <button
             type="button"
@@ -163,13 +158,13 @@ export function SliderRow({
             disabled={disabled}
             title="Reset"
             aria-label={`Reset ${label}`}
-            className="flex h-9 w-9 items-center justify-center border-l border-white/25 text-white hover:bg-white/15 disabled:opacity-50"
+            className="flex h-9 w-9 items-center justify-center border-l border-line text-muted hover:bg-gray-100 disabled:opacity-50"
           >
             <RotateCcw className="h-4 w-4" aria-hidden />
           </button>
         </span>
       </div>
-      <div className="flex items-center gap-2 text-sm text-white/75">
+      <div className="flex items-center gap-2 text-sm text-muted">
         <span className="w-6 text-right">{min}</span>
         <input
           type="range"
@@ -182,7 +177,7 @@ export function SliderRow({
           onChange={(e) => onChange(Number(e.target.value))}
           onPointerUp={() => onCommit()}
           onKeyUp={() => onCommit()}
-          className="flex-1 accent-mint disabled:cursor-not-allowed disabled:opacity-50"
+          className="flex-1 accent-btn disabled:cursor-not-allowed disabled:opacity-50"
         />
         <span className="w-6">{max}</span>
       </div>
@@ -190,7 +185,7 @@ export function SliderRow({
   );
 }
 
-// ------------------------------------------------------------------ page controls (light background)
+// ------------------------------------------------------------------ page controls
 
 /** Popup window in the middle of the screen. */
 export function Modal({
@@ -218,11 +213,11 @@ export function Modal({
         e.preventDefault();
         onClose?.();
       }}
-      className="m-auto w-[min(32rem,calc(100%-2rem))] rounded-2xl border-4 border-brand bg-white p-0 text-ink shadow-2xl backdrop:bg-ink/60"
+      className="m-auto w-[min(32rem,calc(100%-2rem))] rounded-3xl border border-line bg-white p-0 text-ink shadow-2xl backdrop:bg-ink/40 backdrop:backdrop-blur-[2px]"
     >
-      <div className="flex flex-col gap-4 p-5 sm:p-6">
+      <div className="flex flex-col gap-4 p-6 sm:p-7">
         <div className="flex items-start justify-between gap-4">
-          <h2 className="text-xl font-bold sm:text-2xl">{title}</h2>
+          <h2 className="text-2xl font-semibold">{title}</h2>
           {onClose && (
             <button
               type="button"
@@ -240,7 +235,7 @@ export function Modal({
   );
 }
 
-export function BigButton({
+export function Button({
   children,
   onClick,
   disabled,
@@ -250,26 +245,61 @@ export function BigButton({
   children: React.ReactNode;
   onClick: () => void;
   disabled?: boolean;
-  kind?: "main" | "light" | "go";
+  kind?: "main" | "outline" | "ghost";
   className?: string;
 }) {
   const look = {
-    main: "bg-brand-dark text-white hover:bg-brand-darker",
-    go: "bg-green-700 text-white hover:bg-green-800",
-    light: "border-2 border-brand-dark bg-white text-brand-dark hover:bg-gray-100",
+    main: "bg-btn text-white shadow-sm hover:bg-btn-hover",
+    outline: "border border-line bg-white text-btn-hover hover:bg-gray-100",
+    ghost: "text-ink hover:bg-gray-100",
   }[kind];
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className={`inline-flex min-h-13 items-center justify-center gap-2 rounded-xl px-5 py-2.5 text-lg font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${look} ${className}`}
+      className={`inline-flex min-h-12 items-center justify-center gap-2 rounded-xl px-5 font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${look} ${className}`}
     >
       {children}
     </button>
   );
 }
 
+/** Big choice in a popup: icon, title and one line of explanation. */
+export function ChoiceCard({
+  icon,
+  title,
+  text,
+  onClick,
+  primary,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  text: string;
+  onClick: () => void;
+  primary?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex items-start gap-4 rounded-2xl border px-4 py-3.5 text-left transition ${
+        primary ? "border-brand bg-mint-soft hover:bg-mint/40" : "border-line bg-white hover:bg-gray-50"
+      }`}
+    >
+      <span
+        className={`mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${primary ? "bg-btn text-white" : "bg-mint-soft text-btn"}`}
+      >
+        {icon}
+      </span>
+      <span className="flex flex-col">
+        <span className="text-lg font-semibold">{title}</span>
+        <span className="text-sm text-muted">{text}</span>
+      </span>
+    </button>
+  );
+}
+
 export function Spinner() {
-  return <div className="h-12 w-12 animate-spin rounded-full border-[5px] border-sand border-t-brand-dark" aria-hidden />;
+  return <div className="h-11 w-11 animate-spin rounded-full border-4 border-mint-soft border-t-btn" aria-hidden />;
 }

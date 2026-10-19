@@ -39,7 +39,7 @@ export type Result = {
   formats: string[];
 };
 
-export type Health = { ok: boolean; ai: boolean; ai_status: string };
+export type Health = { ok: boolean; ai: boolean; ai_status: string; perfect?: boolean };
 
 export class ApiError extends Error {
   constructor(message: string, public status: number) {
@@ -88,6 +88,12 @@ export function updateSession(id: string, settings: Settings) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(settings),
   });
+}
+
+// "Make border perfect": OpenAI redraws the design as clean line art; returns the image as a data URL.
+// source "sketch" uses the original uploaded photo, "color" uses the scanned image.
+export function makePerfect(id: string, source: "sketch" | "color") {
+  return call<{ image: string }>(`/api/sessions/${id}/perfect?source=${source}`, { method: "POST" });
 }
 
 export function downloadUrl(id: string, fmt: string) {

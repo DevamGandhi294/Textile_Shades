@@ -13,3 +13,6 @@ research/
 models/manga_line_extraction.onnx
 mle/
 *.pth
+
+# secrets (API keys)
+.env

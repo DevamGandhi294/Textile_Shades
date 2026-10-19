@@ -1,26 +1,27 @@
 @import "tailwindcss";
 
-/* One light theme: white pages, brand teal + sand + mint, dark text for strong contrast. */
+/* Light, calm theme: white pages, soft teal/mint accents, warm sand surfaces, dark text. */
 :root {
   --background: #ffffff;
   --foreground: #1b2a2b;
   color-scheme: light;
 }
 
-/* brand: accents · brand-dark: buttons (white text reads well on it) · side: settings sidebar
-   sand: header and footer · mint: cards · ink: main text · muted: helper text */
+/* brand: accents · btn: filled buttons (white text stays readable) · mint/mint-soft: selected and soft areas
+   sand: tips and dividers · line: card borders · ink: text · muted: helper text */
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-brand: #359fa0;
-  --color-brand-dark: #1d6b6c;
-  --color-brand-darker: #154f50;
-  --color-side: #123f40;
-  --color-sand: #f5efe1;
+  --color-btn: #2a8586;
+  --color-btn-hover: #1d6b6c;
   --color-mint: #8ad6d1;
+  --color-mint-soft: #eef8f7;
+  --color-sand: #f5efe1;
+  --color-line: #e3ecea;
   --color-ink: #1b2a2b;
-  --color-muted: #3f5253;
-  --font-sans: var(--font-geist-sans);
+  --color-muted: #55696a;
+  --font-sans: var(--font-app);
 }
 
 html {
@@ -30,35 +31,40 @@ html {
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+  font-family: var(--font-app), Arial, Helvetica, sans-serif;
 }
 
 button:focus-visible,
 a:focus-visible,
 summary:focus-visible,
 input:focus-visible,
-select:focus-visible {
-  outline: 3px solid #359fa0; /* visible on white pages and on the dark sidebar */
+select:focus-visible,
+[role="button"]:focus-visible {
+  outline: 3px solid #359fa0;
   outline-offset: 2px;
 }
 
-/* Big, easy-to-grab sliders */
 input[type="range"] {
-  height: 2rem;
+  height: 1.75rem;
   cursor: pointer;
 }
 
 @keyframes splash-pop {
-  from { opacity: 0; transform: scale(0.92); }
+  from { opacity: 0; transform: scale(0.96); }
   to   { opacity: 1; transform: scale(1); }
 }
 @keyframes splash-bar {
   from { transform: translateX(-100%); }
   to   { transform: translateX(250%); }
 }
+@keyframes panel-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
 .splash-pop { animation: splash-pop 0.5s ease-out both; }
 .splash-bar { animation: splash-bar 1.1s ease-in-out infinite; }
+.panel-in { animation: panel-in 0.2s ease-out both; }
 
 @media (prefers-reduced-motion: reduce) {
-  .splash-pop, .splash-bar, .animate-spin { animation: none; }
+  .splash-pop, .splash-bar, .panel-in, .animate-spin { animation: none; }
 }

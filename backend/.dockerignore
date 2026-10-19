@@ -10,3 +10,4 @@ tests/
 tools/
 samples/
 .git/
+.env

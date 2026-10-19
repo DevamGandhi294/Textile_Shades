@@ -3,23 +3,23 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Check,
-  ChevronsLeft,
-  ChevronsRight,
   CircleQuestionMark,
   ClipboardPaste,
   Clock,
   Download,
-  Lightbulb,
-  Menu,
+  ImagePlus,
+  Info,
   Play,
-  Settings as SettingsIcon,
+  RefreshCw,
   SlidersHorizontal,
   TriangleAlert,
+  Sparkles,
   Upload,
+  X,
 } from "lucide-react";
 import SettingsPanel from "@/components/SettingsPanel";
-import { BigButton, Modal, Spinner } from "@/components/controls";
-import { ApiError, createSession, downloadUrl, getHealth, updateSession, type Result, type Settings } from "@/lib/api";
+import { Button, ChoiceCard, Modal, Spinner } from "@/components/controls";
+import { ApiError, createSession, downloadUrl, getHealth, makePerfect, updateSession, type Result, type Settings } from "@/lib/api";
 import { ALL_FORMATS, DEFAULTS, FORMATS, isDefault } from "@/lib/settings";
 
 const VIEWS = [
@@ -27,15 +27,13 @@ const VIEWS = [
   { key: "scan", label: "Scanned" },
   { key: "clean", label: "Cleaned" },
   { key: "final", label: "Final result" },
+  { key: "perfect", label: "Perfect border" },
   { key: "check", label: "Gap check" },
 ] as const;
 type View = (typeof VIEWS)[number]["key"];
 
-const WIDTH_KEY = "sketch-cleaner-sidebar-width";
-const SIDE_DEFAULT = 320;
-const SIDE_MIN = 260;
-const SIDE_MAX = 560;
-const clampSide = (w: number) => Math.round(Math.min(SIDE_MAX, Math.max(SIDE_MIN, w)));
+const WIDE = 1024; // from this width the settings panel sits next to the page instead of covering it
+const isWide = () => typeof window !== "undefined" && window.innerWidth >= WIDE;
 
 export default function Home() {
   const [splash, setSplash] = useState(true);
@@ -43,6 +41,9 @@ export default function Home() {
   const [server, setServer] = useState<"checking" | "ready" | "waking">("checking");
   const [aiReady, setAiReady] = useState(true);
   const [aiStatus, setAiStatus] = useState("");
+  const [perfectReady, setPerfectReady] = useState(false); // OpenAI key set on the server
+  const [perfectImg, setPerfectImg] = useState<string | null>(null); // "Make border perfect" result
+  const [perfectSource, setPerfectSource] = useState<"sketch" | "color">("sketch"); // which picture is redrawn
 
   const [file, setFile] = useState<File | null>(null);
   const [photoUrl, setPhotoUrl] = useState<string | null>(null);
@@ -52,14 +53,11 @@ export default function Home() {
   const [settings, setSettings] = useState<Settings>(DEFAULTS);
   const [autoCrop, setAutoCrop] = useState(true);
   const [formats, setFormats] = useState<string[]>(ALL_FORMATS);
-  const [busy, setBusy] = useState<"" | "upload" | "update">("");
+  const [busy, setBusy] = useState<"" | "upload" | "update" | "perfect">("");
   const [seconds, setSeconds] = useState(0);
   const [error, setError] = useState("");
   const [view, setView] = useState<View>("final");
-  const [panelOpen, setPanelOpen] = useState(false); // settings drawer on phones
-  const [collapsed, setCollapsed] = useState(false); // settings sidebar folded to a thin strip (big screens)
-  const [sideWidth, setSideWidth] = useState(SIDE_DEFAULT); // dragged by the handle on its right edge
-  const [resizing, setResizing] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
 
   const latest = useRef(settings); // newest settings, also while a slider is moving
@@ -71,10 +69,6 @@ export default function Home() {
     const t = setTimeout(() => {
       setSplash(false);
       setWelcome(true);
-      try {
-        const w = Number(localStorage.getItem(WIDTH_KEY));
-        if (w) setSideWidth(clampSide(w));
-      } catch {}
     }, 1600);
     return () => clearTimeout(t);
   }, []);
@@ -90,6 +84,7 @@ export default function Home() {
           setServer("ready");
           setAiReady(h.ai);
           setAiStatus(h.ai_status);
+          setPerfectReady(!!h.perfect);
           return;
         }
         setServer("waking");
@@ -124,7 +119,8 @@ export default function Home() {
 
   useEffect(() => () => void (photoUrl && URL.revokeObjectURL(photoUrl)), [photoUrl]);
 
-  // Welcome popup answers: start with the recommended settings, or open the settings first.
+  // ------------------------------------------------------------------ welcome popup answers
+
   function welcomeRecommended() {
     setWelcome(false);
     edit(DEFAULTS);
@@ -132,7 +128,7 @@ export default function Home() {
 
   function welcomeOwn() {
     setWelcome(false);
-    openSettings();
+    setSettingsOpen(true);
   }
 
   // ------------------------------------------------------------------ photo and processing
@@ -142,6 +138,7 @@ export default function Home() {
     setFile(f);
     setPhotoUrl(URL.createObjectURL(f));
     setResult(null);
+    setPerfectImg(null);
     setError("");
     setWaiting(true);
     setAsking(true); // always ask before any processing starts
@@ -172,7 +169,7 @@ export default function Home() {
   async function upload(f: File, s: Settings, crop: boolean) {
     setError("");
     setWaiting(false);
-    setPanelOpen(false);
+    if (!isWide()) setSettingsOpen(false); // on phones the panel would cover the progress
     setBusy("upload");
     sent.current = JSON.stringify(s);
     try {
@@ -192,28 +189,13 @@ export default function Home() {
   }
 
   function startWithRecommended() {
-    latest.current = DEFAULTS;
-    setSettings(DEFAULTS);
+    edit(DEFAULTS);
     start(DEFAULTS);
   }
 
   function chooseFirst() {
     setAsking(false);
-    setPanelOpen(true);
-    setCollapsed(false);
-  }
-
-  function resizeSide(w: number) {
-    const next = clampSide(w);
-    setSideWidth(next);
-    try {
-      localStorage.setItem(WIDTH_KEY, String(next));
-    } catch {}
-  }
-
-  function openSettings() {
-    setPanelOpen(true);
-    setCollapsed(false);
+    setSettingsOpen(true);
   }
 
   // ------------------------------------------------------------------ settings
@@ -255,10 +237,26 @@ export default function Home() {
     if (result && file) upload(file, DEFAULTS, true);
   }
 
+  // OpenAI redraws the final lines with clean, smooth curves; shown as its own view.
+  async function runPerfect() {
+    if (!result || busy) return;
+    setError("");
+    setBusy("perfect");
+    try {
+      setPerfectImg((await makePerfect(result.id, perfectSource)).image);
+      setView("perfect");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
   function startOver() {
     setFile(null);
     setPhotoUrl(null);
     setResult(null);
+    setPerfectImg(null);
     setWaiting(false);
     setError("");
   }
@@ -283,151 +281,73 @@ export default function Home() {
     );
   }
 
-  const shownViews = VIEWS.filter((v) => v.key !== "check" || result?.previews.check);
-  const shown = view === "photo" ? photoUrl : result ? (result.previews[view] ?? result.previews.final) : photoUrl;
+  const shownViews = VIEWS.filter(
+    (v) => (v.key !== "check" || result?.previews.check) && (v.key !== "perfect" || perfectImg),
+  );
+  const shown =
+    view === "photo"
+      ? photoUrl
+      : view === "perfect" && perfectImg
+        ? perfectImg
+        : result
+          ? (result.previews[view as Exclude<View, "photo" | "perfect">] ?? result.previews.final)
+          : photoUrl;
 
   return (
     <>
       {splash && <Splash />}
 
-      <div className="flex min-h-screen">
-        {/* Settings sidebar: left side, folds to a thin strip on big screens, slides in on phones */}
-        {panelOpen && <div className="fixed inset-0 z-30 bg-ink/50 lg:hidden" onClick={() => setPanelOpen(false)} aria-hidden />}
-        <aside
-          aria-label="Settings"
-          style={{ "--side-w": `${sideWidth}px` } as React.CSSProperties}
-          className={`fixed inset-y-0 left-0 z-40 flex w-[min(21rem,100%)] shrink-0 flex-col bg-side text-white shadow-2xl duration-200 lg:sticky lg:top-0 lg:h-screen lg:translate-x-0 lg:shadow-none ${
-            resizing ? "transition-none select-none" : "transition-[transform,width]"
-          } ${panelOpen ? "translate-x-0" : "-translate-x-full"} ${collapsed ? "lg:w-16" : "lg:w-(--side-w)"}`}
-        >
-          {/* drag this edge to make the sidebar wider or narrower; double-click to reset */}
-          {!collapsed && (
-            <div
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="Drag to change the settings width"
-              aria-valuemin={SIDE_MIN}
-              aria-valuemax={SIDE_MAX}
-              aria-valuenow={sideWidth}
-              tabIndex={0}
-              title="Drag to make wider or narrower · double-click to reset"
-              onPointerDown={(e) => {
-                e.preventDefault();
-                e.currentTarget.setPointerCapture(e.pointerId);
-                setResizing(true);
-              }}
-              onPointerMove={(e) => resizing && setSideWidth(clampSide(e.clientX))}
-              onPointerUp={(e) => {
-                e.currentTarget.releasePointerCapture(e.pointerId);
-                setResizing(false);
-                resizeSide(e.clientX);
-              }}
-              onDoubleClick={() => resizeSide(SIDE_DEFAULT)}
-              onKeyDown={(e) => {
-                if (e.key === "ArrowRight") resizeSide(sideWidth + 20);
-                if (e.key === "ArrowLeft") resizeSide(sideWidth - 20);
-              }}
-              className={`group absolute top-0 -right-1.5 z-10 hidden h-full w-3 cursor-col-resize lg:block`}
-            >
-              <span
-                className={`mx-auto block h-full w-1 transition-colors ${resizing ? "bg-mint" : "bg-transparent group-hover:bg-mint/70 group-focus-visible:bg-mint"}`}
-              />
+      <header className="border-b border-sand bg-white">
+        <div className="mx-auto flex w-full max-w-[90rem] items-center gap-4 px-4 py-3 sm:px-8 sm:py-4">
+          <div className="min-w-0 flex-1">
+            <h1 className="text-xl font-medium tracking-tight sm:text-2xl">
+              TextileBorder <span className="text-brand">OutlineTool</span>
+            </h1>
+            <p className="hidden text-sm text-muted md:block">
+              Upload a photo or scan of a sketch. It becomes a clean scan automatically; adjust only if needed, then download.
+            </p>
+          </div>
+          <Button kind="ghost" onClick={() => setWelcome(true)} className="px-3">
+            <CircleQuestionMark className="h-5 w-5" aria-hidden /> <span className="hidden sm:inline">Help</span>
+          </Button>
+          <Button onClick={() => setSettingsOpen(!settingsOpen)} className="px-4">
+            <SlidersHorizontal className="h-5 w-5" aria-hidden /> Settings
+          </Button>
+        </div>
+      </header>
+
+      {server === "waking" && (
+        <p className="flex items-center justify-center gap-2 bg-sand px-4 py-2.5 text-center text-sm">
+          <Clock className="h-4 w-4 shrink-0 text-btn" aria-hidden />
+          The service is starting up. The first time this can take about one minute. You can already choose your photo.
+        </p>
+      )}
+
+      <div className="mx-auto flex w-full max-w-[90rem] items-start gap-6 px-4 py-4 sm:px-8 sm:py-5">
+        <main className="flex min-w-0 flex-1 flex-col gap-6">
+          {error && (
+            <div role="alert" className="flex items-start gap-3 rounded-2xl border border-red-200 bg-red-50 px-5 py-4 text-red-900">
+              <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0" aria-hidden />
+              <span className="flex-1">{error}</span>
+              <button type="button" onClick={() => setError("")} aria-label="Close message" className="rounded-full p-1 hover:bg-red-100">
+                <X className="h-4 w-4" aria-hidden />
+              </button>
             </div>
           )}
-          <div className={`flex items-center gap-3 border-b border-white/15 px-4 py-4 ${collapsed ? "lg:justify-center lg:px-2" : ""}`}>
-            <h2 className={`flex flex-1 items-center gap-3 text-xl font-bold ${collapsed ? "lg:hidden" : ""}`}>
-              <SlidersHorizontal className="h-6 w-6 shrink-0 text-mint" aria-hidden />
-              Settings
-            </h2>
-            <button
-              type="button"
-              onClick={() => setCollapsed(!collapsed)}
-              aria-label={collapsed ? "Open settings" : "Close settings"}
-              title={collapsed ? "Open settings" : "Close settings"}
-              className="hidden h-10 w-10 items-center justify-center rounded-lg text-white hover:bg-white/10 lg:inline-flex"
-            >
-              {collapsed ? <ChevronsRight className="h-5 w-5" aria-hidden /> : <ChevronsLeft className="h-5 w-5" aria-hidden />}
-            </button>
-            <button
-              type="button"
-              onClick={() => setPanelOpen(false)}
-              className="min-h-10 rounded-lg bg-mint px-4 font-bold text-ink lg:hidden"
-            >
-              Done
-            </button>
-          </div>
 
-          {/* folded: only icons */}
-          <div className={`flex-col items-center gap-2 py-4 ${collapsed ? "hidden lg:flex" : "hidden"}`}>
-            <button
-              type="button"
-              onClick={() => setCollapsed(false)}
-              title="Open settings"
-              aria-label="Open settings"
-              className="flex h-12 w-12 items-center justify-center rounded-lg bg-white/10 hover:bg-white/20"
-            >
-              <SettingsIcon className="h-6 w-6" aria-hidden />
-            </button>
-            <span className="mt-2 text-xs font-bold tracking-widest text-mint uppercase [writing-mode:vertical-rl]">Settings</span>
-          </div>
-
-          {/* open: all settings */}
-          <div className={`relative flex-1 overflow-y-auto px-4 pt-3 pb-6 ${collapsed ? "lg:hidden" : ""}`}>
-            <SettingsPanel
-              settings={settings}
-              edit={edit}
-              apply={apply}
-              autoCrop={autoCrop}
-              setAutoCrop={changeCrop}
-              formats={formats}
-              setFormats={setFormats}
-              aiReady={aiReady}
-              aiStatus={aiStatus}
-              busy={!!busy}
-              waitingToStart={waiting && !!file}
-              onStart={() => start()}
-              onReset={reset}
-            />
-          </div>
-        </aside>
-
-        <div className="flex min-w-0 flex-1 flex-col">
-          <header className="border-b-4 border-brand bg-sand">
-            <div className="mx-auto flex w-full max-w-5xl items-center gap-3 px-4 py-3 sm:px-6">
-              <button
-                type="button"
-                onClick={openSettings}
-                className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-side px-3 font-bold text-white lg:hidden"
-              >
-                <Menu className="h-5 w-5" aria-hidden /> Settings
-              </button>
-              <div className="flex-1">
-                <h1 className="text-xl font-bold leading-tight sm:text-2xl">TextileBorder OutlineTool</h1>
-                <p className="hidden text-sm text-muted sm:block">
-                  Upload a photo or scan of a sketch. It becomes a clean scan automatically; adjust only if needed, then download.
+          {/* Step 1: upload (empty page) */}
+          {!file && (
+            <Card>
+              <div className="flex flex-col gap-1.5">
+                <span className="mb-1 inline-flex items-center gap-2 self-start rounded-full bg-mint-soft px-3 py-1 text-xs font-bold tracking-wider text-btn-hover uppercase">
+                  <span className="h-1.5 w-1.5 rounded-full bg-brand" aria-hidden /> Start here
+                </span>
+                <h2 className="text-2xl font-semibold tracking-tight sm:text-3xl">Bring your sketch to life.</h2>
+                <p className="max-w-2xl text-muted">
+                  Add a photo of your border drawing. We&apos;ll help turn it into clean lines you can use for embroidery, printing or design.
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setWelcome(true)}
-                className="inline-flex min-h-11 items-center gap-2 rounded-lg border-2 border-brand-dark bg-white px-4 font-bold text-brand-dark hover:bg-gray-100"
-              >
-                <CircleQuestionMark className="h-5 w-5" aria-hidden /> Help
-              </button>
-            </div>
-          </header>
 
-          {server === "waking" && (
-            <p className="flex items-center justify-center gap-2 bg-amber-100 px-4 py-2.5 text-center text-amber-950">
-              <Clock className="h-5 w-5 shrink-0" aria-hidden />
-              The service is starting up. The first time this can take about one minute. You can already choose your photo.
-            </p>
-          )}
-
-          <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-5 px-4 py-5 sm:px-6">
-            {/* Step 1 */}
-            <Card>
-              <StepTitle n={1}>Choose your sketch photo</StepTitle>
               <input ref={pickRef} type="file" accept="image/*" className="hidden" onChange={onPick} />
               <div
                 role="button"
@@ -446,75 +366,79 @@ export default function Home() {
                   const f = e.dataTransfer.files?.[0];
                   if (f) choose(f);
                 }}
-                className={`flex min-h-56 cursor-pointer flex-col items-center justify-center gap-1 rounded-xl border-2 border-dashed p-6 text-center transition hover:bg-gray-100 ${
-                  dragging ? "border-brand-dark bg-gray-100" : "border-brand bg-white"
-                } ${busy ? "pointer-events-none opacity-50" : ""}`}
+                className={`flex cursor-pointer flex-col items-center justify-center gap-1 rounded-2xl border-2 border-dashed px-6 py-5 text-center transition ${
+                  dragging ? "border-brand bg-mint-soft" : "border-mint bg-mint-soft/50 hover:bg-gray-50"
+                }`}
               >
-                <Upload className="mb-2 h-10 w-10 text-brand-dark" aria-hidden />
-                <span className="text-xl font-bold">Drop image here</span>
-                <span className="text-muted">- or -</span>
-                <span className="text-xl font-bold text-brand-darker">Click to upload</span>
-              </div>
-              <div className="flex flex-wrap items-center justify-center gap-3">
-                <BigButton onClick={() => pickRef.current?.click()} disabled={!!busy} className="flex-1 sm:flex-none">
+                <span className="mb-1.5 flex h-11 w-11 items-center justify-center rounded-xl bg-mint-soft text-btn shadow-sm ring-1 ring-mint/50">
+                  <ImagePlus className="h-6 w-6" aria-hidden />
+                </span>
+                <span className="text-lg font-semibold">Drop image here</span>
+                <span className="text-sm text-muted">— or —</span>
+                <span className="text-sm text-muted">Click to upload · JPG, PNG or TIFF</span>
+                <span className="mt-3 inline-flex min-h-11 items-center gap-2 rounded-xl bg-btn px-5 font-semibold text-white shadow-sm">
                   <Upload className="h-5 w-5" aria-hidden /> Upload photo
-                </BigButton>
-                <BigButton onClick={pasteImage} disabled={!!busy} kind="light" className="flex-1 sm:flex-none">
-                  <ClipboardPaste className="h-5 w-5" aria-hidden /> Paste from clipboard
-                </BigButton>
+                </span>
               </div>
-              <p className="text-center text-sm text-muted">You can also copy an image and press Ctrl + V on this page.</p>
-              <p className="flex items-start gap-2">
-                <Lightbulb className="mt-0.5 h-5 w-5 shrink-0 text-brand-dark" aria-hidden />
-                Put the paper on a table in good light and take the photo from straight above.
+
+              <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
+                <Button kind="outline" onClick={pasteImage} disabled={!!busy} className="min-h-11">
+                  <ClipboardPaste className="h-5 w-5" aria-hidden /> Paste from clipboard
+                </Button>
+                <p className="text-sm text-muted">You can also copy an image and press Ctrl + V on this page.</p>
+              </div>
+
+              <p className="flex items-start gap-3 rounded-2xl bg-sand px-4 py-3 text-sm">
+                <Info className="mt-0.5 h-5 w-5 shrink-0 text-btn" aria-hidden />
+                <span>
+                  <b className="font-semibold">A little photo tip:</b> Good light and a straight-above photo help us find the lines in your drawing.
+                </span>
               </p>
             </Card>
+          )}
 
-            {error && (
-              <div role="alert" className="flex items-start gap-3 rounded-xl border-2 border-red-300 bg-red-50 px-4 py-3 text-lg text-red-900">
-                <TriangleAlert className="mt-1 h-5 w-5 shrink-0" aria-hidden />
-                {error}
+          {/* Photo chosen, waiting for the user to start */}
+          {waiting && file && !busy && (
+            <Card>
+              <CardTitle step="Step 2" title="Your photo is ready" />
+              {photoUrl && (
+                // eslint-disable-next-line @next/next/no-img-element -- local photo preview
+                <img src={photoUrl} alt="Your photo" className="max-h-96 w-full rounded-2xl bg-gray-50 object-contain" />
+              )}
+              <p className="text-muted">Check the settings, then press Start cleaning.</p>
+              <div className="flex flex-wrap gap-3">
+                <Button onClick={() => start()}>
+                  <Play className="h-5 w-5" aria-hidden /> Start cleaning
+                </Button>
+                <Button kind="outline" onClick={() => setSettingsOpen(true)}>
+                  <SlidersHorizontal className="h-5 w-5" aria-hidden /> Settings
+                </Button>
+                <Button kind="ghost" onClick={startOver}>
+                  Choose another photo
+                </Button>
               </div>
-            )}
+            </Card>
+          )}
 
-            {/* Photo chosen, waiting for the user to start */}
-            {waiting && file && !busy && (
-              <Card>
-                <StepTitle n={2}>Your photo is ready</StepTitle>
-                {photoUrl && (
-                  // eslint-disable-next-line @next/next/no-img-element -- local photo preview
-                  <img src={photoUrl} alt="Your photo" className="max-h-72 w-full rounded-lg bg-white object-contain" />
-                )}
-                <p>Check the settings on the left, then press Start.</p>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <BigButton kind="go" onClick={() => start()}>
-                    <Play className="h-5 w-5" aria-hidden /> Start cleaning
-                  </BigButton>
-                  <BigButton kind="light" onClick={openSettings}>
-                    <SettingsIcon className="h-5 w-5" aria-hidden /> Settings
-                  </BigButton>
-                </div>
-              </Card>
-            )}
+          {busy === "upload" && (
+            <Card>
+              <div className="flex flex-col items-center gap-3 py-16 text-center">
+                <Spinner />
+                <p className="text-xl font-semibold">Cleaning your sketch… {seconds} s</p>
+                <p className="text-muted">
+                  This usually takes 20 to 40 seconds. Please keep this page open.
+                  {server === "waking" && " The service is still starting, so the first time can take longer."}
+                </p>
+              </div>
+            </Card>
+          )}
 
-            {busy === "upload" && (
-              <Card>
-                <div className="flex flex-col items-center gap-3 py-5 text-center">
-                  <Spinner />
-                  <p className="text-xl font-bold">Cleaning your sketch… {seconds} s</p>
-                  <p className="text-muted">
-                    This usually takes 20 to 40 seconds. Please keep this page open.
-                    {server === "waking" && " The service is still starting, so the first time can take longer."}
-                  </p>
-                </div>
-              </Card>
-            )}
-
-            {/* Step 2 */}
-            {result && busy !== "upload" && (
-              <Card>
-                <StepTitle n={2}>Check the result</StepTitle>
-                <div className="flex flex-wrap gap-2" role="tablist">
+          {/* Step 2: result */}
+          {result && busy !== "upload" && (
+            <Card>
+              <div className="flex flex-wrap items-end justify-between gap-3">
+                <CardTitle step="Step 2" title="Check the result" />
+                <div className="flex flex-wrap gap-1 rounded-xl bg-gray-100 p-1" role="tablist">
                   {shownViews.map((v) => (
                     <button
                       key={v.key}
@@ -522,166 +446,261 @@ export default function Home() {
                       role="tab"
                       aria-selected={view === v.key}
                       onClick={() => setView(v.key)}
-                      className={`min-h-11 flex-1 rounded-lg px-3 font-semibold whitespace-nowrap ${
-                        view === v.key ? "bg-side text-white" : "bg-white text-ink hover:bg-gray-100"
+                      className={`min-h-10 rounded-lg px-3 text-sm font-semibold transition ${
+                        view === v.key ? "bg-white text-ink shadow-sm" : "text-muted hover:text-ink"
                       }`}
                     >
                       {v.label}
                     </button>
                   ))}
                 </div>
-                {view === "check" && (
-                  <p className="rounded-lg bg-white px-3 py-2 text-sm">
-                    Every closed area has its own colour. <b className="text-green-800">Green</b> = gaps that were joined.{" "}
-                    <b className="text-red-800">Red circle</b> = open line end, where colour fill could leak.
-                  </p>
-                )}
-                <div className="relative flex min-h-64 items-center justify-center overflow-hidden rounded-lg bg-white">
-                  {shown && (
-                    // eslint-disable-next-line @next/next/no-img-element -- previews are data URLs from the API
-                    <img src={shown} alt={VIEWS.find((v) => v.key === view)?.label} className="max-h-[70vh] w-full object-contain" />
-                  )}
-                  {busy === "update" && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white/80">
-                      <Spinner />
-                      <p className="text-lg font-bold">Updating… {seconds} s</p>
-                    </div>
-                  )}
-                </div>
-                <Summary result={result} />
-                <BigButton kind="light" onClick={openSettings} className="lg:hidden">
-                  <SettingsIcon className="h-5 w-5" aria-hidden /> Change settings
-                </BigButton>
-              </Card>
-            )}
-
-            {/* Step 3 */}
-            {result && busy !== "upload" && (
-              <Card>
-                <StepTitle n={3}>Download</StepTitle>
-                <a
-                  href={downloadUrl(result.id, "zip")}
-                  className={`flex min-h-14 items-center justify-center gap-2 rounded-xl bg-green-700 px-5 text-xl font-bold text-white hover:bg-green-800 ${busy ? "pointer-events-none opacity-50" : ""}`}
-                >
-                  <Download className="h-6 w-6" aria-hidden /> Download all files (ZIP)
-                </a>
-                {chosen.length > 0 && (
-                  <>
-                    <p>Or download one file at a time:</p>
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      {chosen.map((f) => (
-                        <a
-                          key={f.fmt}
-                          href={downloadUrl(result.id, f.fmt)}
-                          className={`flex flex-col rounded-lg border-2 border-white bg-white px-3 py-2 hover:border-brand-dark hover:bg-gray-100 ${busy ? "pointer-events-none opacity-50" : ""}`}
-                        >
-                          <span className="flex items-center gap-2 font-bold">
-                            <Download className="h-4 w-4 shrink-0" aria-hidden /> {f.label}
-                          </span>
-                          <span className="text-sm text-muted">{f.hint}</span>
-                        </a>
-                      ))}
-                    </div>
-                    {chosen.length > 1 && chosen.length < ready.length && (
-                      <BigButton kind="light" onClick={downloadChosen} disabled={!!busy}>
-                        <Download className="h-5 w-5" aria-hidden /> Download my {chosen.length} chosen files
-                      </BigButton>
-                    )}
-                  </>
-                )}
-                <p className="text-sm text-muted">
-                  Choose which file types to show in Settings → Download settings → Formats.
-                  {!bw && " Vector, CAD and print files need the black & white output."}
+              </div>
+              {view === "check" && (
+                <p className="rounded-xl bg-gray-50 px-4 py-2.5 text-sm text-muted">
+                  Every closed area has its own colour. <b className="text-green-800">Green</b> = gaps that were joined.{" "}
+                  <b className="text-red-800">Red circle</b> = open line end, where colour fill could leak.
                 </p>
-                <button type="button" onClick={startOver} className="self-start font-bold text-brand-darker underline">
-                  Start again with a new photo
-                </button>
-              </Card>
-            )}
-          </main>
+              )}
+              <div className="relative flex min-h-72 items-center justify-center overflow-hidden rounded-2xl border border-line bg-gray-50">
+                {shown && (
+                  // eslint-disable-next-line @next/next/no-img-element -- previews are data URLs from the API
+                  <img src={shown} alt={VIEWS.find((v) => v.key === view)?.label} className="max-h-[70vh] w-full object-contain" />
+                )}
+                {(busy === "update" || busy === "perfect") && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white/80 backdrop-blur-[1px]">
+                    <Spinner />
+                    <p className="font-semibold">
+                      {busy === "perfect" ? "Making the border perfect…" : "Updating…"} {seconds} s
+                    </p>
+                    {busy === "perfect" && <p className="text-sm text-muted">This takes about 30–60 seconds.</p>}
+                  </div>
+                )}
+              </div>
+              <Summary result={result} />
+              {perfectReady && (
+                <div className="flex flex-col items-start gap-3 rounded-2xl border border-brand/40 bg-mint-soft p-4 sm:flex-row sm:items-center">
+                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-btn text-white">
+                    <Sparkles className="h-5 w-5" aria-hidden />
+                  </span>
+                  <div className="flex flex-1 flex-col gap-2">
+                    <p className="font-semibold">Make the border perfect</p>
+                    <p className="text-sm text-muted">
+                      AI redraws your design as clean line art with smooth curves, keeping the same design. Takes about 30–60
+                      seconds. The result appears as “Perfect border” next to Final result.
+                    </p>
+                    <fieldset className="flex flex-wrap items-center gap-2" disabled={!!busy}>
+                      <legend className="sr-only">My picture is</legend>
+                      <span className="text-sm font-semibold">My picture is:</span>
+                      {(
+                        [
+                          ["sketch", "Sketch", "uses your original photo"],
+                          ["color", "Coloured design", "uses the scanned image"],
+                        ] as const
+                      ).map(([value, label, hint]) => (
+                        <label
+                          key={value}
+                          title={hint}
+                          className={`relative flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-1.5 text-sm transition ${
+                            perfectSource === value ? "border-brand bg-white font-semibold" : "border-line bg-white/60 hover:bg-white"
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name="perfect-source"
+                            checked={perfectSource === value}
+                            onChange={() => setPerfectSource(value)}
+                            className="sr-only"
+                          />
+                          <span
+                            className={`flex h-4 w-4 items-center justify-center rounded-full border-2 ${perfectSource === value ? "border-btn" : "border-gray-300"}`}
+                            aria-hidden
+                          >
+                            {perfectSource === value && <span className="h-2 w-2 rounded-full bg-btn" />}
+                          </span>
+                          {label}
+                          <span className="text-xs font-normal text-muted">({hint})</span>
+                        </label>
+                      ))}
+                    </fieldset>
+                  </div>
+                  <Button onClick={runPerfect} disabled={!!busy}>
+                    <Sparkles className="h-5 w-5" aria-hidden /> {perfectImg ? "Make it again" : "Make border perfect"}
+                  </Button>
+                </div>
+              )}
+            </Card>
+          )}
 
-        </div>
+          {/* Step 3: download */}
+          {result && busy !== "upload" && (
+            <Card>
+              <CardTitle step="Step 3" title="Download" />
+              <a
+                href={downloadUrl(result.id, "zip")}
+                className={`inline-flex min-h-14 items-center justify-center gap-2 rounded-xl bg-btn px-6 text-lg font-semibold text-white shadow-sm hover:bg-btn-hover ${busy ? "pointer-events-none opacity-50" : ""}`}
+              >
+                <Download className="h-5 w-5" aria-hidden /> Download all files (ZIP)
+              </a>
+              {perfectImg && (
+                <a
+                  href={downloadUrl(result.id, "perfect")}
+                  className={`flex items-center gap-3 rounded-xl border border-brand bg-mint-soft px-4 py-3 transition hover:bg-mint/40 ${busy ? "pointer-events-none opacity-50" : ""}`}
+                >
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-btn text-white">
+                    <Sparkles className="h-4 w-4" aria-hidden />
+                  </span>
+                  <span className="flex flex-col">
+                    <span className="font-semibold">Perfect border (PNG)</span>
+                    <span className="text-sm text-muted">The AI-smoothed version. Also included in the ZIP.</span>
+                  </span>
+                </a>
+              )}
+              {chosen.length > 0 && (
+                <>
+                  <p className="text-sm text-muted">Or download one file at a time:</p>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {chosen.map((f) => (
+                      <a
+                        key={f.fmt}
+                        href={downloadUrl(result.id, f.fmt)}
+                        className={`flex items-center gap-3 rounded-xl border border-line bg-white px-4 py-3 transition hover:bg-gray-50 ${busy ? "pointer-events-none opacity-50" : ""}`}
+                      >
+                        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-mint-soft text-btn">
+                          <Download className="h-4 w-4" aria-hidden />
+                        </span>
+                        <span className="flex flex-col">
+                          <span className="font-semibold">{f.label}</span>
+                          <span className="text-sm text-muted">{f.hint}</span>
+                        </span>
+                      </a>
+                    ))}
+                  </div>
+                  {chosen.length > 1 && chosen.length < ready.length && (
+                    <Button kind="outline" onClick={downloadChosen} disabled={!!busy} className="self-start">
+                      <Download className="h-5 w-5" aria-hidden /> Download my {chosen.length} chosen files
+                    </Button>
+                  )}
+                </>
+              )}
+              <p className="text-sm text-muted">
+                Choose which file types to show in Settings → Download settings → Formats.
+                {!bw && " Vector, CAD and print files need the black & white output."}
+              </p>
+              <Button kind="ghost" onClick={startOver} className="self-start px-3">
+                <RefreshCw className="h-4 w-4" aria-hidden /> Start again with a new photo
+              </Button>
+            </Card>
+          )}
+        </main>
+
+        {/* Settings panel: next to the page on big screens, full screen on phones */}
+        {settingsOpen && (
+          <>
+            <div className="fixed inset-0 z-30 bg-ink/30 lg:hidden" onClick={() => setSettingsOpen(false)} aria-hidden />
+            <aside
+              aria-label="Settings"
+              className="panel-in fixed inset-y-0 right-0 z-40 flex w-full max-w-md flex-col bg-white shadow-2xl lg:sticky lg:top-6 lg:z-auto lg:max-h-[calc(100vh-3rem)] lg:w-96 lg:shrink-0 lg:rounded-3xl lg:border lg:border-line lg:shadow-sm"
+            >
+              <div className="flex items-start gap-3 border-b border-line px-6 py-5">
+                <SlidersHorizontal className="mt-1 h-5 w-5 shrink-0 text-brand" aria-hidden />
+                <div className="flex-1">
+                  <h2 className="text-xl font-semibold">Settings</h2>
+                  <p className="text-sm text-muted">Adjust your outline and file types.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSettingsOpen(false)}
+                  aria-label="Close settings"
+                  className="flex h-9 w-9 items-center justify-center rounded-full text-ink hover:bg-gray-100"
+                >
+                  <X className="h-5 w-5" aria-hidden />
+                </button>
+              </div>
+              <div className="relative flex-1 overflow-y-auto px-6 py-5">
+                <SettingsPanel
+                  settings={settings}
+                  edit={edit}
+                  apply={apply}
+                  autoCrop={autoCrop}
+                  setAutoCrop={changeCrop}
+                  formats={formats}
+                  setFormats={setFormats}
+                  aiReady={aiReady}
+                  aiStatus={aiStatus}
+                  busy={!!busy}
+                  waitingToStart={waiting && !!file}
+                  onStart={() => start()}
+                  onReset={reset}
+                />
+              </div>
+            </aside>
+          </>
+        )}
       </div>
 
       {/* When the site opens: how it works, then recommended or own settings */}
       <Modal open={welcome && !splash} title="Welcome" onClose={() => setWelcome(false)}>
-        <p className="text-lg">Make a clean drawing from a photo in 3 easy steps:</p>
+        <p className="text-muted">Make a clean drawing from a photo in 3 easy steps:</p>
         <ol className="flex flex-col gap-2">
           {(
             [
               [Upload, "Upload or paste a photo of your sketch."],
-              [SettingsIcon, "Use our recommended settings, or choose your own."],
+              [SlidersHorizontal, "Use our recommended settings, or choose your own."],
               [Download, "Download your files for embroidery, printing or CAD."],
             ] as const
           ).map(([Icon, text], i) => (
-            <li key={i} className="flex items-center gap-3 rounded-xl bg-mint px-3 py-2.5">
-              <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-side font-bold text-white">{i + 1}</span>
-              <Icon className="h-5 w-5 shrink-0 text-side" aria-hidden />
+            <li key={i} className="flex items-center gap-3 rounded-xl bg-gray-50 px-3 py-2.5">
+              <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-mint-soft text-sm font-bold text-btn">
+                {i + 1}
+              </span>
+              <Icon className="h-5 w-5 shrink-0 text-btn" aria-hidden />
               <span>{text}</span>
             </li>
           ))}
         </ol>
-        <p className="text-lg font-bold">Which settings do you want to use?</p>
-        <button
-          type="button"
+        <p className="mt-1 font-semibold">Which settings do you want to use?</p>
+        <ChoiceCard
+          primary
+          icon={<Check className="h-5 w-5" aria-hidden />}
+          title="Use recommended settings"
+          text="Best for most sketches. You do not need to change anything."
           onClick={welcomeRecommended}
-          className="flex flex-col rounded-xl bg-green-700 px-4 py-3 text-left text-white hover:bg-green-800"
-        >
-          <span className="flex items-center gap-2 text-xl font-bold">
-            <Check className="h-5 w-5" aria-hidden /> Use recommended settings
-          </span>
-          <span className="text-white/90">Best for most sketches. You do not need to change anything.</span>
-        </button>
-        <button
-          type="button"
+        />
+        <ChoiceCard
+          icon={<SlidersHorizontal className="h-5 w-5" aria-hidden />}
+          title="Choose my own settings"
+          text="Opens the settings panel. Then upload your photo."
           onClick={welcomeOwn}
-          className="flex flex-col rounded-xl border-2 border-brand-dark bg-white px-4 py-3 text-left text-brand-darker hover:bg-gray-100"
-        >
-          <span className="flex items-center gap-2 text-xl font-bold">
-            <SettingsIcon className="h-5 w-5" aria-hidden /> Choose my own settings
-          </span>
-          <span className="text-muted">Opens the settings on the left. Then upload your photo.</span>
-        </button>
+        />
       </Modal>
 
       {/* Before any processing: recommended or own settings? */}
       <Modal open={asking} title="How should we clean your photo?" onClose={() => setAsking(false)}>
         {photoUrl && (
           // eslint-disable-next-line @next/next/no-img-element -- local photo preview
-          <img src={photoUrl} alt="Your photo" className="max-h-44 w-full rounded-lg border-2 border-sand object-contain" />
+          <img src={photoUrl} alt="Your photo" className="max-h-44 w-full rounded-2xl bg-gray-50 object-contain" />
         )}
-        <button
-          type="button"
+        <ChoiceCard
+          primary
+          icon={<Check className="h-5 w-5" aria-hidden />}
+          title="Use recommended settings"
+          text="Best for most sketches. Starts now."
           onClick={startWithRecommended}
-          className="flex flex-col rounded-xl bg-green-700 px-4 py-3 text-left text-white hover:bg-green-800"
-        >
-          <span className="flex items-center gap-2 text-xl font-bold">
-            <Check className="h-5 w-5" aria-hidden /> Use recommended settings
-          </span>
-          <span className="text-white/90">Best for most sketches. Starts now.</span>
-        </button>
+        />
         {!isDefault(settings) && (
-          <button
-            type="button"
+          <ChoiceCard
+            icon={<Play className="h-5 w-5" aria-hidden />}
+            title="Use my settings"
+            text="The settings you chose before. Starts now."
             onClick={() => start()}
-            className="flex flex-col rounded-xl bg-brand-dark px-4 py-3 text-left text-white hover:bg-brand-darker"
-          >
-            <span className="flex items-center gap-2 text-xl font-bold">
-              <Play className="h-5 w-5" aria-hidden /> Use my settings
-            </span>
-            <span className="text-white/90">The settings you chose before. Starts now.</span>
-          </button>
+          />
         )}
-        <button
-          type="button"
+        <ChoiceCard
+          icon={<SlidersHorizontal className="h-5 w-5" aria-hidden />}
+          title="Let me choose settings first"
+          text="Opens the settings. Press Start cleaning when you are ready."
           onClick={chooseFirst}
-          className="flex flex-col rounded-xl border-2 border-brand-dark bg-white px-4 py-3 text-left text-brand-darker hover:bg-gray-100"
-        >
-          <span className="flex items-center gap-2 text-xl font-bold">
-            <SettingsIcon className="h-5 w-5" aria-hidden /> Let me choose settings first
-          </span>
-          <span className="text-muted">Opens the settings. Press Start when you are ready.</span>
-        </button>
+        />
       </Modal>
     </>
   );
@@ -690,11 +709,13 @@ export default function Home() {
 function Splash() {
   return (
     <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-6 bg-white" role="status" aria-label="Loading">
-      <div className="splash-pop flex flex-col items-center gap-4">
-        <h1 className="text-3xl font-bold text-ink sm:text-4xl">Sketch Cleaner</h1>
+      <div className="splash-pop flex flex-col items-center gap-3 text-center">
+        <h1 className="text-3xl font-medium tracking-tight sm:text-4xl">
+          TextileBorder <span className="text-brand">OutlineTool</span>
+        </h1>
         <p className="text-lg text-muted">Clean lines from your sketch photos</p>
       </div>
-      <div className="h-2 w-52 overflow-hidden rounded-full bg-sand">
+      <div className="h-1.5 w-48 overflow-hidden rounded-full bg-mint-soft">
         <div className="splash-bar h-full w-1/3 rounded-full bg-brand" />
       </div>
     </div>
@@ -702,15 +723,15 @@ function Splash() {
 }
 
 function Card({ children }: { children: React.ReactNode }) {
-  return <section className="flex flex-col gap-4 rounded-2xl bg-mint p-4 sm:p-5">{children}</section>;
+  return <section className="flex flex-col gap-4 rounded-3xl border border-line bg-white p-5 shadow-sm sm:p-6">{children}</section>;
 }
 
-function StepTitle({ n, children }: { n: number; children: React.ReactNode }) {
+function CardTitle({ step, title }: { step: string; title: string }) {
   return (
-    <h2 className="flex items-center gap-3 text-xl font-bold">
-      <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-side text-lg text-white">{n}</span>
-      {children}
-    </h2>
+    <div className="flex flex-col gap-1">
+      <span className="text-xs font-bold tracking-widest text-brand uppercase">{step}</span>
+      <h2 className="text-2xl font-semibold tracking-tight">{title}</h2>
+    </div>
   );
 }
 
@@ -731,7 +752,7 @@ function Summary({ result }: { result: Result }) {
     <div className="flex flex-col gap-2">
       <ul className="flex flex-wrap gap-2 text-sm">
         {items.map((t) => (
-          <li key={t} className="rounded-md bg-white px-2.5 py-1 font-medium">
+          <li key={t} className="rounded-full bg-mint-soft px-3 py-1 font-medium text-btn-hover">
             {t}
           </li>
         ))}
