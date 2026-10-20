@@ -14,6 +14,7 @@ uploaded image; the Session is kept in memory so a settings change only re-runs 
 """
 import argparse
 import base64
+import logging
 import os
 import re
 import shutil
@@ -38,6 +39,8 @@ from pydantic import BaseModel, Field, ValidationError
 from sketchclean import CleanSettings, EvenSettings, OutputSettings, Session, Settings
 from sketchclean import ai
 import perfect
+
+log = logging.getLogger("textileborder.api")
 
 MAX_UPLOAD_MB = 20
 MAX_SESSIONS = 20                    # each one holds a few full-size images in memory
@@ -204,9 +207,10 @@ def create_session(file: UploadFile = File(...), auto_crop: bool = Form(True), s
     try:
         sess = Session(src, auto_crop=auto_crop)
         sess.update(s)
-    except Exception as e:
+    except Exception:
+        log.exception("could not process upload %r", name)       # real reason in the server log only
         shutil.rmtree(folder, ignore_errors=True)
-        raise HTTPException(400, f"Could not read this photo: {e}")
+        raise HTTPException(400, "Could not read this photo. Please upload a JPG or PNG.")
     entry = Entry(sess, folder, stem)
     return _result(_add(entry), entry)
 
