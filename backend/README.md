@@ -22,6 +22,7 @@ python app.py                 # GUI in your browser (http://127.0.0.1:7860)
 python api.py                 # web API for the Next.js site in ../frontend (http://127.0.0.1:8000/docs)
 python cli.py sketch.jpg      # command line, files go to ./outputs
 python tests/smoke_test.py    # checks every sample runs and writes every file
+python tests/api_test.py      # checks the web API (limits, errors, Make border perfect; no network)
 ```
 
 The AI model is in `models/` (`manga_line_extraction_int8.onnx`, 44 MB). If the model or
@@ -91,6 +92,33 @@ under 1 s on a GPU). After that, every setting change reuses it and takes a few 
 | Smooth and straighten | 0 follows the pencil · 1 balanced · 2 very smooth |
 | Join small breaks | Bridges a gap where two line ends face each other, as thick as that line |
 
+## Make border perfect (optional, paid)
+
+The website's **Make border perfect** button sends the picture to an OpenAI image model, which
+redraws the same design as clean line art with smooth curves (`perfect.py`). "Sketch" sends the
+original uploaded photo, "Coloured design" sends the scanned image. The answer is turned into
+crisp black lines on white, 2400 px on the long side.
+
+Settings go in `backend/.env` (copy `.env.example`; never commit `.env`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPENAI_API_KEY` | — | needed; without it the button is hidden |
+| `OPENAI_IMAGE_MODEL` | `gpt-image-2` | image model |
+| `OPENAI_IMAGE_QUALITY` | `medium` | `low` for cheap previews; `high` costs about 4× medium |
+| `OPENAI_INPUT_FIDELITY` | `low` | gpt-image-1 models only |
+| `API_TOKEN` | not set | if set, the call needs `Authorization: Bearer <token>` (a warning is logged when unset) |
+| `PERFECT_MAX_PER_SESSION` | 3 | paid calls per uploaded photo (then HTTP 429) |
+| `PERFECT_MAX_PER_HOUR` | 60 | paid calls for the whole server in a rolling hour (then HTTP 429) |
+| `ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | websites allowed to call the API |
+
+Every successful call adds one line to `outputs/openai_usage.jsonl` (time, session, model,
+quality, size, source and OpenAI's token usage) for cost tracking. Calls are never retried
+automatically, because every call is paid.
+
+The AI result is a **PNG only**: it is not vectorised, so it is not in the SVG / PDF / EPS / DXF
+files. It is included in the ZIP download.
+
 ## Outputs
 
 | File | Use |
@@ -127,7 +155,8 @@ tools/
   export_onnx.py          make the full-precision ONNX model from the original weights
   compare_binarization.py research: 9 binarization algorithms side by side (needs doxapy)
   make_samples.py         generates the synthetic test sketches
-tests/smoke_test.py       every sample × 4 settings, all formats
+tests/smoke_test.py       every sample × 6 settings, all formats
+tests/api_test.py         web API: setting limits, errors, Make border perfect (no network)
 samples/                  test images
 ```
 

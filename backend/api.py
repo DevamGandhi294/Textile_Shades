@@ -9,7 +9,8 @@ uploaded image; the Session is kept in memory so a settings change only re-runs 
 
     POST /api/sessions                  upload a photo  -> id + previews
     POST /api/sessions/{id}/update      new settings    -> previews
-    GET  /api/sessions/{id}/download    ?fmt=zip|png|pdf|svg|eps|dxf|tiff|bmp
+    POST /api/sessions/{id}/perfect     ?source=sketch|color  -> AI redraw (paid, limited; see README)
+    GET  /api/sessions/{id}/download    ?fmt=zip|png|pdf|svg|eps|dxf|tiff|bmp|perfect
     GET  /api/health
 """
 import argparse
@@ -286,7 +287,8 @@ def update_session(sid: str, settings: SettingsIn):
 
 @app.post("/api/sessions/{sid}/perfect")
 def make_perfect(sid: str, source: str = "sketch", authorization: Optional[str] = Header(None)):
-    """'Make border perfect': an OpenAI image model (gpt-image-1, medium quality by default) redraws the design as clean line art.
+    """'Make border perfect': an OpenAI image model (gpt-image-2 by default, see OPENAI_IMAGE_MODEL;
+    medium quality, see OPENAI_IMAGE_QUALITY) redraws the design as clean line art.
     source=sketch sends the original uploaded photo; source=color sends the scanned image (checkpoint 1).
     Paid: needs API_TOKEN (if set), and is limited per photo and per hour."""
     token = os.environ.get("API_TOKEN")
