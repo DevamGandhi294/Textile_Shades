@@ -16,6 +16,19 @@ from pathlib import Path
 from sketchclean import CleanSettings, EvenSettings, OutputSettings, Session, Settings
 
 
+def _ranged(kind, lo, hi):
+    """argparse type: a number between lo and hi (same limits as the web API)."""
+    def check(text):
+        try:
+            v = kind(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+        if not lo <= v <= hi:
+            raise argparse.ArgumentTypeError(f"{v} is outside {lo} .. {hi}")
+        return v
+    return check
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("inputs", nargs="+", help="photos or scans")
@@ -28,23 +41,23 @@ def main(argv=None):
 
     c = p.add_argument_group("2 · clean")
     c.add_argument("--keep-shading", action="store_true", help="do not remove soft shading / smudges")
-    c.add_argument("--contrast", type=float, default=0.0, help="-1 softer .. +1 stronger (default 0)")
-    c.add_argument("--thickness", type=float, default=0.0, help="-2 thinner .. +3 bolder (default 0)")
-    c.add_argument("--sharpness", type=float, default=0.6, help="0 .. 2, scanner output (default 0.6)")
+    c.add_argument("--contrast", type=_ranged(float, -1, 1), default=0.0, help="-1 softer .. +1 stronger (default 0)")
+    c.add_argument("--thickness", type=_ranged(float, -2, 3), default=0.0, help="-2 thinner .. +3 bolder (default 0)")
+    c.add_argument("--sharpness", type=_ranged(float, 0, 2), default=0.6, help="0 .. 2, scanner output (default 0.6)")
 
     e = p.add_argument_group("3 · even out (bw)")
     e.add_argument("--even", choices=["uniform", "light", "full", "off"], default="uniform",
                    help="line width: uniform = same pen width everywhere (default), light, full = per line, off")
-    e.add_argument("--pen", type=float, default=0.0, help="uniform pen width in photo pixels (0 = automatic)")
-    e.add_argument("--beautify", type=float, default=1.0,
+    e.add_argument("--pen", type=_ranged(float, 0, 100), default=0.0, help="uniform pen width in photo pixels (0 = automatic)")
+    e.add_argument("--beautify", type=_ranged(float, 0, 2), default=1.0,
                    help="uniform: 0 off .. 1 normal .. 2 strong — smooth curves, close lines that stop short")
-    e.add_argument("--smooth", type=float, default=1.0, help="0 follow pencil .. 2 very smooth (default 1)")
+    e.add_argument("--smooth", type=_ranged(float, 0, 2), default=1.0, help="0 follow pencil .. 2 very smooth (default 1)")
     e.add_argument("--no-join", action="store_true", help="do not bridge small gaps")
 
     o = p.add_argument_group("download")
     o.add_argument("--color", default="#000000", help="line colour (default #000000)")
-    o.add_argument("--dpi", type=int, default=300)
-    o.add_argument("--width-cm", type=float, default=0.0, help="output width in cm (0 = automatic)")
+    o.add_argument("--dpi", type=_ranged(int, 72, 1200), default=300, help="72 .. 1200 (default 300)")
+    o.add_argument("--width-cm", type=_ranged(float, 0, 300), default=0.0, help="output width in cm, 0 .. 300 (0 = automatic)")
     o.add_argument("--formats", default="png,tiff,bmp,svg,pdf,eps,dxf")
     a = p.parse_args(argv)
 

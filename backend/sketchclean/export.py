@@ -13,6 +13,9 @@ from .imageio import hex_rgb, save_bw, save_gray
 from .vectorize import render
 
 
+MAX_OUTPUT_PIXELS = 120_000_000                              # about 11000 x 11000 px
+
+
 class Page:
     """Maps working pixels to the output page (pixels and points) for one export."""
     def __init__(self, work_w, work_h, dpi, width_cm=0.0):
@@ -20,6 +23,8 @@ class Page:
         self.out_w = int(round(width_cm / 2.54 * dpi)) if width_cm else work_w
         self.scale = self.out_w / work_w                     # working px -> output px
         self.out_h = int(round(work_h * self.scale))
+        if self.out_w * self.out_h > MAX_OUTPUT_PIXELS:
+            raise ValueError("That size is too large. Lower the DPI or width.")
         self.pt = 72.0 / dpi * self.scale                     # working px -> points
         self.mm = (self.out_w / dpi * 25.4, self.out_h / dpi * 25.4)
 

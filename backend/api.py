@@ -25,6 +25,7 @@ import zipfile
 from collections import OrderedDict
 from dataclasses import asdict
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -32,7 +33,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image, ImageOps
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from sketchclean import CleanSettings, EvenSettings, OutputSettings, Session, Settings
 from sketchclean import ai
@@ -54,26 +55,25 @@ _c, _e, _o = CleanSettings(), EvenSettings(), OutputSettings()
 
 
 class SettingsIn(BaseModel):
-    """Every setting is optional; missing ones use the same defaults as the GUI."""
-    output: str = _c.output
-    method: str = _c.method
+    """Every setting is optional; missing ones use the same defaults as the GUI.
+    Out-of-range or unknown values are rejected with HTTP 422 (same limits as cli.py)."""
+    output: Literal["bw", "scan"] = _c.output
+    method: Literal["ai", "classic"] = _c.method
     keep_detail: bool = _c.keep_detail
     remove_shading: bool = _c.remove_shading
-    contrast: float = _c.contrast
-    sharpness: float = _c.sharpness
-    thickness: float = _c.thickness
-    even_width: str = _e.even_width
-    uniform_width: float = _e.uniform_width
-    beautify: float = _e.beautify
-    smooth: float = _e.smooth
+    contrast: float = Field(_c.contrast, ge=-1, le=1)
+    sharpness: float = Field(_c.sharpness, ge=0, le=2)
+    thickness: float = Field(_c.thickness, ge=-2, le=3)
+    even_width: Literal["off", "light", "full", "uniform"] = _e.even_width
+    uniform_width: float = Field(_e.uniform_width, ge=0, le=100)
+    beautify: float = Field(_e.beautify, ge=0, le=2)
+    smooth: float = Field(_e.smooth, ge=0, le=2)
     join_gaps: bool = _e.join_gaps
     color: str = _o.color
-    dpi: int = _o.dpi
-    width_cm: float = _o.width_cm
+    dpi: int = Field(_o.dpi, ge=72, le=1200)
+    width_cm: float = Field(_o.width_cm, ge=0, le=300)       # 0 = keep working size
 
     def to_settings(self) -> Settings:
-        if self.output not in ("bw", "scan"):
-            raise HTTPException(422, "output must be 'bw' or 'scan'")
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", self.color):
             raise HTTPException(422, "color must look like #000000")
         return Settings(
@@ -185,7 +185,10 @@ def create_session(file: UploadFile = File(...), auto_crop: bool = Form(True), s
     name = Path(file.filename or "sketch.jpg").name
     if Path(name).suffix.lower() not in IMAGE_TYPES:
         raise HTTPException(415, "Please upload a photo (JPG or PNG).")
-    s = SettingsIn.model_validate_json(settings or "{}").to_settings()
+    try:
+        s = SettingsIn.model_validate_json(settings or "{}").to_settings()
+    except ValidationError as e:
+        raise HTTPException(422, e.errors(include_url=False, include_context=False, include_input=False))
 
     folder = Path(tempfile.mkdtemp(prefix="sketch_api_"))
     stem = re.sub(r"[^\w-]+", "_", Path(name).stem)[:40] or "sketch"
@@ -256,7 +259,10 @@ def download(sid: str, fmt: str = "zip"):
     with entry.lock:
         out = entry.folder / "files"
         shutil.rmtree(out, ignore_errors=True)
-        files = entry.sess.export(out, entry.stem)
+        try:
+            files = entry.sess.export(out, entry.stem)
+        except ValueError as e:                  # Page: output size over the pixel limit
+            raise HTTPException(422, str(e))
         if fmt == "zip":
             bundle = entry.folder / f"{entry.stem}_all_files.zip"
             with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
