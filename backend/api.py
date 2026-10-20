@@ -58,8 +58,12 @@ SESSION_TTL = 60 * 60                # seconds without use before a session is d
 ALL_FORMATS = ("png", "tiff", "bmp", "svg", "pdf", "eps", "dxf")
 IMAGE_TYPES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 
-# comma-separated list of website addresses allowed to call the API ("*" = any)
-ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+# comma-separated list of website addresses allowed to call the API from a browser
+# (default: the local Next.js dev server; set ALLOWED_ORIGINS to the live site address)
+ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+           if o.strip()]
+if "*" in ORIGINS:
+    log.warning("ALLOWED_ORIGINS contains '*': any website can call this API from a browser.")
 
 
 # ----------------------------------------------------------------- settings
