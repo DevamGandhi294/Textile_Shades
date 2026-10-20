@@ -14,6 +14,8 @@ uploaded image; the Session is kept in memory so a settings change only re-runs 
 """
 import argparse
 import base64
+import hmac
+import json
 import logging
 import os
 import re
@@ -23,14 +25,15 @@ import threading
 import time
 import uuid
 import zipfile
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image, ImageOps
@@ -40,7 +43,14 @@ from sketchclean import CleanSettings, EvenSettings, OutputSettings, Session, Se
 from sketchclean import ai
 import perfect
 
+HERE = Path(__file__).resolve().parent
+USAGE_LOG = HERE / "outputs" / "openai_usage.jsonl"     # one line per paid OpenAI call (cost tracking)
+
 log = logging.getLogger("textileborder.api")
+
+if not os.environ.get("API_TOKEN"):                # read from the environment or backend/.env (see perfect.py)
+    log.warning("API_TOKEN is not set: anyone who can reach this API can use the paid 'Make border perfect'. "
+                "Set API_TOKEN outside local development.")
 
 MAX_UPLOAD_MB = 20
 MAX_SESSIONS = 20                    # each one holds a few full-size images in memory
@@ -95,11 +105,56 @@ class Entry:
         self.sess, self.folder, self.stem = sess, folder, stem
         self.lock = threading.Lock()         # one change at a time per image
         self.used = time.time()
-        self.perfect = None                  # PNG from "Make border perfect" (cleared when settings change)
+        self.perfect = None                  # PNG from "Make border perfect"
+        self.perfect_calls = 0               # paid calls used (or running) for this photo
 
 
 _sessions: "OrderedDict[str, Entry]" = OrderedDict()
 _store_lock = threading.Lock()
+
+_perfect_times: deque = deque()                # start times of paid calls in the last hour (all sessions)
+_perfect_lock = threading.Lock()
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _reserve_hourly():
+    """Take one slot of PERFECT_MAX_PER_HOUR (rolling hour). Returns its timestamp, or None if full."""
+    now = time.time()
+    with _perfect_lock:
+        while _perfect_times and now - _perfect_times[0] > 3600:
+            _perfect_times.popleft()
+        if len(_perfect_times) >= _env_int("PERFECT_MAX_PER_HOUR", 60):
+            return None
+        _perfect_times.append(now)
+        return now
+
+
+def _release_hourly(stamp):
+    """Give a slot back when the paid call failed."""
+    with _perfect_lock:
+        try:
+            _perfect_times.remove(stamp)
+        except ValueError:
+            pass
+
+
+def _log_usage(sid, source, meta):
+    """Append one JSON line per successful paid call; a logging problem never breaks the request."""
+    try:
+        USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        line = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"), "session": sid,
+                "model": meta.get("model"), "quality": meta.get("quality"), "size": meta.get("size"),
+                "source": source, "usage": meta.get("usage")}
+        with open(USAGE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+    except Exception:
+        log.exception("could not write %s", USAGE_LOG)
 
 
 def _drop(entry: Entry):
@@ -226,27 +281,54 @@ def update_session(sid: str, settings: SettingsIn):
 
 
 @app.post("/api/sessions/{sid}/perfect")
-def make_perfect(sid: str, source: str = "sketch"):
-    """'Make border perfect': OpenAI gpt-image-1 (medium) redraws the design as clean line art.
-    source=sketch sends the original uploaded photo; source=color sends the scanned image (checkpoint 1)."""
+def make_perfect(sid: str, source: str = "sketch", authorization: Optional[str] = Header(None)):
+    """'Make border perfect': an OpenAI image model (gpt-image-1, medium quality by default) redraws the design as clean line art.
+    source=sketch sends the original uploaded photo; source=color sends the scanned image (checkpoint 1).
+    Paid: needs API_TOKEN (if set), and is limited per photo and per hour."""
+    token = os.environ.get("API_TOKEN")
+    if token and not hmac.compare_digest((authorization or "").encode(), f"Bearer {token}".encode()):
+        raise HTTPException(401, "Not allowed: missing or wrong API token.")
     if source not in ("sketch", "color"):
         raise HTTPException(422, "source must be 'sketch' or 'color'")
     entry = _get(sid)
+
+    # copy what the call needs and reserve this photo's slot, then let go of the lock:
+    # the paid call can take a minute and must not block other requests for this photo
+    max_per_session = _env_int("PERFECT_MAX_PER_SESSION", 3)
     with entry.lock:
+        if entry.perfect_calls >= max_per_session:
+            raise HTTPException(429, f"Make border perfect can be used {max_per_session} times per photo. "
+                                     "Upload the photo again to try more.")
         s = entry.sess
         if source == "sketch":
             picture = np.asarray(ImageOps.exif_transpose(Image.open(s.path)).convert("RGB"))
         else:
-            picture = s.preview_scan()
-        try:
-            rgb = perfect.make_perfect(picture, source, s.settings.output.color)
-        except perfect.PerfectError as e:
-            raise HTTPException(502, str(e))
+            picture = s.preview_scan().copy()
+        color, dpi = s.settings.output.color, s.settings.output.dpi
+        entry.perfect_calls += 1
+    stamp = _reserve_hourly()
+    if stamp is None:
+        with entry.lock:
+            entry.perfect_calls -= 1
+        raise HTTPException(429, "Make border perfect has been used too often in the last hour. "
+                                 "Please try again later.")
+
+    try:
+        rgb, meta = perfect.make_perfect(picture, source, color)
+    except perfect.PerfectError as e:
+        with entry.lock:
+            entry.perfect_calls -= 1          # nothing was made, so the slot is given back
+        _release_hourly(stamp)
+        raise HTTPException(502, str(e))
+    _log_usage(sid, source, meta)
+
+    with entry.lock:
+        if not entry.folder.exists():          # the photo expired while the call was running
+            raise HTTPException(404, "This picture has expired. Please upload it again.")
         path = entry.folder / f"{entry.stem}_perfect.png"
-        dpi = s.settings.output.dpi
         Image.fromarray(rgb, "RGB").save(path, dpi=(dpi, dpi))
         entry.perfect = path
-        return {"image": _data_url(rgb)}
+    return {"image": _data_url(rgb)}
 
 
 @app.get("/api/sessions/{sid}/download")

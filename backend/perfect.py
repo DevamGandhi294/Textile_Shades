@@ -77,7 +77,9 @@ def _size_for(w, h):
 
 def make_perfect(image, kind="sketch", color="#000000"):
     """image: uint8 gray or RGB picture to redraw. kind: 'sketch' or 'color' (picks the prompt).
-    Returns an RGB uint8 image (lines in `color` on white), long side MAX_SIDE."""
+    Returns (rgb, meta): rgb is a uint8 image (lines in `color` on white), long side MAX_SIDE;
+    meta is {model, quality, size, usage} for the cost log (usage as OpenAI reports it, or None).
+    Makes exactly one request: no automatic retry, because every request is paid."""
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         raise PerfectError("Make border perfect is not set up: add OPENAI_API_KEY to backend/.env")
@@ -106,6 +108,8 @@ def make_perfect(image, kind="sketch", color="#000000"):
     files = {"image": ("picture.png", png.tobytes(), "image/png")}
     try:
         r = httpx.post(API, data=data, files=files, headers={"Authorization": f"Bearer {key}"}, timeout=300)
+    except httpx.TimeoutException:
+        raise PerfectError("OpenAI took too long to answer (more than 5 minutes). Please try again later.")
     except httpx.HTTPError as e:
         raise PerfectError(f"Could not reach OpenAI: {e}")
     if r.status_code != 200:
@@ -120,7 +124,8 @@ def make_perfect(image, kind="sketch", color="#000000"):
         raise PerfectError(msg)
 
     try:
-        b64 = r.json()["data"][0]["b64_json"]
+        body = r.json()
+        b64 = body["data"][0]["b64_json"]
     except (KeyError, IndexError, ValueError):
         raise PerfectError("OpenAI did not return an image. Please try again.")
     res = cv2.imdecode(np.frombuffer(base64.b64decode(b64), np.uint8), cv2.IMREAD_GRAYSCALE)
@@ -135,4 +140,4 @@ def make_perfect(image, kind="sketch", color="#000000"):
     c = (color or "#000000").lstrip("#")
     rgb = np.full((out_h, out_w, 3), 255, np.uint8)
     rgb[ink] = tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
-    return rgb
+    return rgb, {"model": model, "quality": quality, "size": size, "usage": body.get("usage")}
