@@ -22,24 +22,41 @@ import numpy as np
 API = "https://api.openai.com/v1/images/edits"
 MAX_SIDE = 2400            # long side of the returned result (same as the working size)
 
-_RULES = """
-- Keep exactly the same design: every motif, curl, leaf, petal, dot, hatch pattern and shape stays in the same place, with the same size and proportions. Do not add, remove, move, simplify or reinterpret anything.
-- Make every curve smooth and flowing, with no wobble, bumps or jagged edges; make straight lines perfectly straight.
-- Use one clean, even line thickness for the outlines.
-- Close small gaps so outlines that are meant to be closed are fully closed.
-- Pure black lines on a pure white background. No grey, shading, colour, fill, texture, text or added frame.
-- Keep the same framing and aspect ratio, with the design in the same position."""
+# The prompt sent with every "Make border perfect" call (the same text for Sketch and Coloured design).
+PROMPT = """**Task: Precision Line-Art Cleanup and Restoration**
 
-PROMPTS = {
-    "sketch": "This is a photo of a hand-drawn textile border sketch (pencil or pen on paper), used for "
-              "embroidery and CAD.\n\nRedraw this sketch as perfect, professional black line art. Ignore the "
-              "paper, shadows, uneven light, smudges and pencil shading; keep only the drawn lines and make "
-              "them perfect:" + _RULES,
-    "color": "This is a grayscale scan of a coloured textile border design (print or embroidery), used for "
-             "embroidery and CAD.\n\nTrace this design as perfect, professional black outline line art: draw "
-             "the outline of every motif, shape and colour area exactly where it is, and leave the inside of "
-             "every shape white:" + _RULES,
-}
+Treat the uploaded image as the exact source of truth. Perform a meticulous, detail-preserving cleanup of the existing artwork. This is a restoration task, NOT a redesign, recreation, or reinterpretation.
+
+**1. Preserve the Original Artwork**
+- Preserve the exact original design, including every motif, curl, leaf, petal, feather, dot, decorative element, hatch pattern, intersection, and contour.
+- Keep every element in its original position, orientation, size, proportion, and relationship to surrounding elements.
+- Preserve the original composition, spacing, repetition, framing, and aspect ratio.
+- Do not invent missing details, replace motifs, or alter the recognizable identity of the artwork.
+- Do not add, remove, move, duplicate, simplify, or embellish any design element.
+
+**2. Precision Line Refinement**
+- Clean and refine the existing outlines while following their original paths as closely as possible.
+- Make curves smooth, continuous, and naturally flowing, without wobbling, bumps, jagged edges, or accidental distortions.
+- Make intended straight lines straight and maintain the original geometry of curved and ornamental shapes.
+- Use consistent, clean black linework while preserving intentional differences between fine details and major outlines where necessary to retain the original design.
+- Remove accidental breaks, rough edges, stray marks, and unwanted line artifacts.
+- Close tiny unintended gaps where outlines are clearly meant to connect or form enclosed shapes.
+- Preserve intentional openings, overlaps, intersections, and separations. Never connect lines merely because they are close together.
+- Keep intricate details sharp and distinguishable. Do not merge adjacent lines, fill narrow spaces, or thicken strokes until details are lost.
+
+**3. Output Appearance**
+- Pure black linework (#000000) on a pure white background (#FFFFFF).
+- No gray pixels in the intended final artwork, shading, gradients, colors, shadows, textures, or solid decorative fills.
+- No new borders, frames, labels, signatures, or text.
+- Maintain the exact original crop, canvas proportions, and artwork placement.
+- Produce a clean, high-resolution result with crisp, precise contours suitable for printing and detailed line-art use.
+
+**4. Strict Fidelity Check**
+Before finalizing, compare the result against the uploaded reference. Verify that all original design elements remain present, in the same positions and proportions, and that no new elements have appeared. Prioritize fidelity to the source over artistic improvement.
+
+**Most important instruction:** Clean the original linework, not the original design. If a detail is unclear, preserve its existing appearance rather than guessing or inventing a replacement. The final image should look like the exact same original artwork, only cleaner, sharper, smoother, and more precise."""
+
+PROMPTS = {"sketch": PROMPT, "color": PROMPT}
 
 
 def _load_env():

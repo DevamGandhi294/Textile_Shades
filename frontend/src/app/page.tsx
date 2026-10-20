@@ -9,21 +9,20 @@ import {
   Download,
   ImagePlus,
   Info,
+  LoaderCircle,
   Play,
   RefreshCw,
   SlidersHorizontal,
   TriangleAlert,
-  Sparkles,
   Upload,
   X,
 } from "lucide-react";
 import SettingsPanel from "@/components/SettingsPanel";
 import { Button, ChoiceCard, Modal, Spinner } from "@/components/controls";
-import { ApiError, createSession, downloadUrl, getHealth, makePerfect, updateSession, type Result, type Settings } from "@/lib/api";
-import { ALL_FORMATS, DEFAULTS, FORMATS, isDefault } from "@/lib/settings";
+import { ApiError, createSession, downloadFile, getHealth, makePerfect, updateSession, type Result, type Settings } from "@/lib/api";
+import { ALL_FORMATS, DEFAULTS, FORMATS, isDefault, outputTooLarge } from "@/lib/settings";
 
 const VIEWS = [
-  { key: "photo", label: "Your photo" },
   { key: "scan", label: "Scanned" },
   { key: "clean", label: "Cleaned" },
   { key: "final", label: "Final result" },
@@ -43,7 +42,6 @@ export default function Home() {
   const [aiStatus, setAiStatus] = useState("");
   const [perfectReady, setPerfectReady] = useState(false); // OpenAI key set on the server
   const [perfectImg, setPerfectImg] = useState<string | null>(null); // "Make border perfect" result
-  const [perfectSource, setPerfectSource] = useState<"sketch" | "color">("sketch"); // which picture is redrawn
 
   const [file, setFile] = useState<File | null>(null);
   const [photoUrl, setPhotoUrl] = useState<string | null>(null);
@@ -59,6 +57,7 @@ export default function Home() {
   const [view, setView] = useState<View>("final");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [downloading, setDownloading] = useState(""); // file type being prepared for download
 
   const latest = useRef(settings); // newest settings, also while a slider is moving
   const sent = useRef(""); // settings the server last processed, to skip repeat calls
@@ -243,9 +242,14 @@ export default function Home() {
     setError("");
     setBusy("perfect");
     try {
-      setPerfectImg((await makePerfect(result.id, perfectSource)).image);
+      const answer = await makePerfect(result.id);
+      setPerfectImg(answer.image);
+      setResult((r) => (r ? { ...r, perfect: answer.perfect } : r));
       setView("perfect");
     } catch (e) {
+      // limit for this photo reached: show the counter as full so the button is disabled
+      if (e instanceof ApiError && e.status === 429 && e.message.includes("per photo"))
+        setResult((r) => (r?.perfect ? { ...r, perfect: { ...r.perfect, used: r.perfect.limit } } : r));
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy("");
@@ -267,31 +271,43 @@ export default function Home() {
   const ready = result ? FORMATS.filter((f) => result.formats.includes(f.fmt)) : [];
   const chosen = ready.filter((f) => formats.includes(f.fmt));
 
-  function downloadChosen() {
-    if (!result) return;
-    chosen.forEach((f, i) =>
-      setTimeout(() => {
-        const a = document.createElement("a");
-        a.href = downloadUrl(result.id, f.fmt);
-        a.download = "";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      }, i * 1500),
-    );
+  const tooLarge = !!result && outputTooLarge(result.info.width, result.info.height, settings);
+  const usage = result?.perfect;
+  const perfectUsedUp = !!usage && usage.used >= usage.limit;
+
+  // Save one file; errors (for example "That size is too large") are shown on the page.
+  async function save(fmt: string, ext: string) {
+    if (!result || downloading) return;
+    setError("");
+    setDownloading(fmt);
+    try {
+      await downloadFile(result.id, fmt, `${result.name}.${ext}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDownloading("");
+    }
   }
+
+  async function downloadChosen() {
+    for (const f of chosen) {
+      await save(f.fmt, f.fmt);
+      await new Promise((r) => setTimeout(r, 600)); // browsers block many saves at the same moment
+    }
+  }
+
+  const blocked = !!busy || !!downloading;
 
   const shownViews = VIEWS.filter(
     (v) => (v.key !== "check" || result?.previews.check) && (v.key !== "perfect" || perfectImg),
   );
   const shown =
-    view === "photo"
-      ? photoUrl
-      : view === "perfect" && perfectImg
-        ? perfectImg
-        : result
-          ? (result.previews[view as Exclude<View, "photo" | "perfect">] ?? result.previews.final)
-          : photoUrl;
+    view === "perfect" && perfectImg
+      ? perfectImg
+      : result
+        ? (result.previews[view as Exclude<View, "perfect">] ?? result.previews.final)
+        : null;
+  const shownLabel = VIEWS.find((v) => v.key === view)?.label ?? "Result";
 
   return (
     <>
@@ -300,7 +316,7 @@ export default function Home() {
       <header className="border-b border-sand bg-white">
         <div className="mx-auto flex w-full max-w-[90rem] items-center gap-4 px-4 py-3 sm:px-8 sm:py-4">
           <div className="min-w-0 flex-1">
-            <h1 className="text-xl font-medium tracking-tight sm:text-2xl">
+            <h1 className="text-xl font-bold tracking-tight sm:text-2xl">
               TextileBorder <span className="text-brand">OutlineTool</span>
             </h1>
             <p className="hidden text-sm text-muted md:block">
@@ -461,71 +477,60 @@ export default function Home() {
                   <b className="text-red-800">Red circle</b> = open line end, where colour fill could leak.
                 </p>
               )}
-              <div className="relative flex min-h-72 items-center justify-center overflow-hidden rounded-2xl border border-line bg-gray-50">
-                {shown && (
-                  // eslint-disable-next-line @next/next/no-img-element -- previews are data URLs from the API
-                  <img src={shown} alt={VIEWS.find((v) => v.key === view)?.label} className="max-h-[70vh] w-full object-contain" />
-                )}
-                {(busy === "update" || busy === "perfect") && (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white/80 backdrop-blur-[1px]">
-                    <Spinner />
-                    <p className="font-semibold">
-                      {busy === "perfect" ? "Making the border perfect…" : "Updating…"} {seconds} s
-                    </p>
-                    {busy === "perfect" && <p className="text-sm text-muted">This takes about 30–60 seconds.</p>}
+              {/* left: always the original photo · right: the tab that is selected */}
+              <div className="grid gap-4 md:grid-cols-2">
+                <figure className="flex min-w-0 flex-col gap-2">
+                  <figcaption className="text-sm font-semibold text-muted">Original photo</figcaption>
+                  <div className="flex min-h-72 flex-1 items-center justify-center overflow-hidden rounded-2xl border border-line bg-gray-50">
+                    {photoUrl && (
+                      // eslint-disable-next-line @next/next/no-img-element -- local photo preview
+                      <img src={photoUrl} alt="Original photo" className="max-h-[70vh] w-full object-contain" />
+                    )}
                   </div>
-                )}
+                </figure>
+                <figure className="flex min-w-0 flex-col gap-2">
+                  <figcaption className="text-sm font-semibold text-muted">{shownLabel}</figcaption>
+                  <div className="relative flex min-h-72 flex-1 items-center justify-center overflow-hidden rounded-2xl border border-line bg-gray-50">
+                    {shown && (
+                      // eslint-disable-next-line @next/next/no-img-element -- previews are data URLs from the API
+                      <img src={shown} alt={shownLabel} className="max-h-[70vh] w-full object-contain" />
+                    )}
+                    {(busy === "update" || busy === "perfect") && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white/80 px-4 text-center backdrop-blur-[1px]">
+                        <Spinner />
+                        <p className="font-semibold">
+                          {busy === "perfect" ? "Making the border perfect…" : "Updating…"} {seconds} s
+                        </p>
+                        {busy === "perfect" && (
+                          <p className="text-sm text-muted">Usually under a minute, sometimes up to a few minutes.</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </figure>
               </div>
               <Summary result={result} />
               {perfectReady && (
                 <div className="flex flex-col items-start gap-3 rounded-2xl border border-brand/40 bg-mint-soft p-4 sm:flex-row sm:items-center">
-                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-btn text-white">
-                    <Sparkles className="h-5 w-5" aria-hidden />
-                  </span>
-                  <div className="flex flex-1 flex-col gap-2">
-                    <p className="font-semibold">Make the border perfect</p>
+                  <div className="flex flex-1 flex-col gap-1">
+                    <p className="font-semibold">Make this perfect outline border</p>
                     <p className="text-sm text-muted">
-                      AI redraws your design as clean line art with smooth curves, keeping the same design. Takes about 30–60
-                      seconds. The result appears as “Perfect border” next to Final result.
+                      Use this button to get a clean, smooth outline of your design. The result appears as “Perfect border”
+                      next to Final result.
                     </p>
-                    <fieldset className="flex flex-wrap items-center gap-2" disabled={!!busy}>
-                      <legend className="sr-only">My picture is</legend>
-                      <span className="text-sm font-semibold">My picture is:</span>
-                      {(
-                        [
-                          ["sketch", "Sketch", "uses your original photo"],
-                          ["color", "Coloured design", "uses the scanned image"],
-                        ] as const
-                      ).map(([value, label, hint]) => (
-                        <label
-                          key={value}
-                          title={hint}
-                          className={`relative flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-1.5 text-sm transition ${
-                            perfectSource === value ? "border-brand bg-white font-semibold" : "border-line bg-white/60 hover:bg-white"
-                          }`}
-                        >
-                          <input
-                            type="radio"
-                            name="perfect-source"
-                            checked={perfectSource === value}
-                            onChange={() => setPerfectSource(value)}
-                            className="sr-only"
-                          />
-                          <span
-                            className={`flex h-4 w-4 items-center justify-center rounded-full border-2 ${perfectSource === value ? "border-btn" : "border-gray-300"}`}
-                            aria-hidden
-                          >
-                            {perfectSource === value && <span className="h-2 w-2 rounded-full bg-btn" />}
-                          </span>
-                          {label}
-                          <span className="text-xs font-normal text-muted">({hint})</span>
-                        </label>
-                      ))}
-                    </fieldset>
                   </div>
-                  <Button onClick={runPerfect} disabled={!!busy}>
-                    <Sparkles className="h-5 w-5" aria-hidden /> {perfectImg ? "Make it again" : "Make border perfect"}
-                  </Button>
+                  <div className="flex flex-col items-start gap-1 sm:items-end">
+                    <Button onClick={runPerfect} disabled={!!busy || perfectUsedUp}>
+                      {perfectImg ? "Make it again" : "Make perfect outline border"}
+                    </Button>
+                    {usage && (
+                      <span className="text-xs text-muted">
+                        {perfectUsedUp
+                          ? "Limit reached for this photo. Upload it again to try more."
+                          : `Used ${usage.used} of ${usage.limit} for this photo`}
+                      </span>
+                    )}
+                  </div>
                 </div>
               )}
             </Card>
@@ -535,48 +540,63 @@ export default function Home() {
           {result && busy !== "upload" && (
             <Card>
               <CardTitle step="Step 3" title="Download" />
-              <a
-                href={downloadUrl(result.id, "zip")}
-                className={`inline-flex min-h-14 items-center justify-center gap-2 rounded-xl bg-btn px-6 text-lg font-semibold text-white shadow-sm hover:bg-btn-hover ${busy ? "pointer-events-none opacity-50" : ""}`}
+              {tooLarge && (
+                <p role="alert" className="flex items-start gap-2 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-900">
+                  <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+                  That size is too large to download. Lower the DPI or the width in Settings → Download settings.
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={() => save("zip", "zip")}
+                disabled={blocked || tooLarge}
+                className="inline-flex min-h-14 items-center justify-center gap-2 rounded-xl bg-btn px-6 text-lg font-semibold text-white shadow-sm hover:bg-btn-hover disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <Download className="h-5 w-5" aria-hidden /> Download all files (ZIP)
-              </a>
+                <DownloadIcon busy={downloading === "zip"} className="h-5 w-5" />
+                {downloading === "zip" ? "Preparing the ZIP…" : "Download all files (ZIP)"}
+              </button>
               {perfectImg && (
-                <a
-                  href={downloadUrl(result.id, "perfect")}
-                  className={`flex items-center gap-3 rounded-xl border border-brand bg-mint-soft px-4 py-3 transition hover:bg-mint/40 ${busy ? "pointer-events-none opacity-50" : ""}`}
+                <button
+                  type="button"
+                  onClick={() => save("perfect", "png")}
+                  disabled={blocked}
+                  className="flex items-center gap-3 rounded-xl border border-brand bg-mint-soft px-4 py-3 text-left transition hover:bg-mint/40 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-btn text-white">
-                    <Sparkles className="h-4 w-4" aria-hidden />
-                  </span>
                   <span className="flex flex-col">
-                    <span className="font-semibold">Perfect border (PNG)</span>
-                    <span className="text-sm text-muted">The AI-smoothed version. Also included in the ZIP.</span>
+                    <span className="font-semibold">
+                      {downloading === "perfect" ? "Preparing…" : "Perfect border (PNG)"}
+                    </span>
+                    <span className="text-sm text-muted">
+                      The AI-smoothed version, as a picture only: it is not in the SVG, PDF, EPS or DXF files. Also
+                      included in the ZIP.
+                    </span>
                   </span>
-                </a>
+                </button>
               )}
               {chosen.length > 0 && (
                 <>
                   <p className="text-sm text-muted">Or download one file at a time:</p>
                   <div className="grid gap-2 sm:grid-cols-2">
                     {chosen.map((f) => (
-                      <a
+                      <button
                         key={f.fmt}
-                        href={downloadUrl(result.id, f.fmt)}
-                        className={`flex items-center gap-3 rounded-xl border border-line bg-white px-4 py-3 transition hover:bg-gray-50 ${busy ? "pointer-events-none opacity-50" : ""}`}
+                        type="button"
+                        onClick={() => save(f.fmt, f.fmt === "tiff" ? "tif" : f.fmt)}
+                        disabled={blocked || tooLarge}
+                        className="flex items-center gap-3 rounded-xl border border-line bg-white px-4 py-3 text-left transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-mint-soft text-btn">
-                          <Download className="h-4 w-4" aria-hidden />
+                          <DownloadIcon busy={downloading === f.fmt} className="h-4 w-4" />
                         </span>
                         <span className="flex flex-col">
                           <span className="font-semibold">{f.label}</span>
                           <span className="text-sm text-muted">{f.hint}</span>
                         </span>
-                      </a>
+                      </button>
                     ))}
                   </div>
                   {chosen.length > 1 && chosen.length < ready.length && (
-                    <Button kind="outline" onClick={downloadChosen} disabled={!!busy} className="self-start">
+                    <Button kind="outline" onClick={downloadChosen} disabled={blocked || tooLarge} className="self-start">
                       <Download className="h-5 w-5" aria-hidden /> Download my {chosen.length} chosen files
                     </Button>
                   )}
@@ -631,6 +651,7 @@ export default function Home() {
                   waitingToStart={waiting && !!file}
                   onStart={() => start()}
                   onReset={reset}
+                  sizeTooLarge={tooLarge}
                 />
               </div>
             </aside>
@@ -706,11 +727,19 @@ export default function Home() {
   );
 }
 
+function DownloadIcon({ busy, className }: { busy: boolean; className: string }) {
+  return busy ? (
+    <LoaderCircle className={`${className} animate-spin`} aria-hidden />
+  ) : (
+    <Download className={className} aria-hidden />
+  );
+}
+
 function Splash() {
   return (
     <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-6 bg-white" role="status" aria-label="Loading">
       <div className="splash-pop flex flex-col items-center gap-3 text-center">
-        <h1 className="text-3xl font-medium tracking-tight sm:text-4xl">
+        <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">
           TextileBorder <span className="text-brand">OutlineTool</span>
         </h1>
         <p className="text-lg text-muted">Clean lines from your sketch photos</p>

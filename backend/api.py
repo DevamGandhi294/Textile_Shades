@@ -33,11 +33,10 @@ from pathlib import Path
 from typing import Literal, Optional
 
 import cv2
-import numpy as np
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from PIL import Image, ImageOps
+from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 
 from sketchclean import CleanSettings, EvenSettings, OutputSettings, Session, Settings
@@ -227,13 +226,20 @@ def _result(sid: str, entry: Entry):
             "seconds": s.timing,
         },
         "formats": ["zip", "png", "tiff", "bmp"] + (["svg", "pdf", "eps", "dxf"] if s.even is not None else []),
+        "perfect": _perfect_usage(entry),
     }
+
+
+def _perfect_usage(entry: Entry):
+    """Paid 'Make border perfect' calls used for this photo and the limit, so the website can show them."""
+    return {"used": entry.perfect_calls, "limit": _env_int("PERFECT_MAX_PER_SESSION", 3)}
 
 
 # ----------------------------------------------------------------- app
 
 app = FastAPI(title="TextileBorder OutlineTool API")
-app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["*"], allow_headers=["*"],
+                   expose_headers=["Content-Disposition"])     # the website reads the download's file name
 
 
 @app.get("/api/health")
@@ -289,7 +295,7 @@ def update_session(sid: str, settings: SettingsIn):
 def make_perfect(sid: str, source: str = "sketch", authorization: Optional[str] = Header(None)):
     """'Make border perfect': an OpenAI image model (gpt-image-2 by default, see OPENAI_IMAGE_MODEL;
     medium quality, see OPENAI_IMAGE_QUALITY) redraws the design as clean line art.
-    source=sketch sends the original uploaded photo; source=color sends the scanned image (checkpoint 1).
+    Both sources send the scanned image (checkpoint 1); source is kept for the usage log.
     Paid: needs API_TOKEN (if set), and is limited per photo and per hour."""
     token = os.environ.get("API_TOKEN")
     if token and not hmac.compare_digest((authorization or "").encode(), f"Bearer {token}".encode()):
@@ -306,10 +312,7 @@ def make_perfect(sid: str, source: str = "sketch", authorization: Optional[str] 
             raise HTTPException(429, f"Make border perfect can be used {max_per_session} times per photo. "
                                      "Upload the photo again to try more.")
         s = entry.sess
-        if source == "sketch":
-            picture = np.asarray(ImageOps.exif_transpose(Image.open(s.path)).convert("RGB"))
-        else:
-            picture = s.preview_scan().copy()
+        picture = s.preview_scan().copy()     # the scanned image (checkpoint 1) for both Sketch and Coloured design
         color, dpi = s.settings.output.color, s.settings.output.dpi
         entry.perfect_calls += 1
     stamp = _reserve_hourly()
@@ -334,7 +337,8 @@ def make_perfect(sid: str, source: str = "sketch", authorization: Optional[str] 
         path = entry.folder / f"{entry.stem}_perfect.png"
         Image.fromarray(rgb, "RGB").save(path, dpi=(dpi, dpi))
         entry.perfect = path
-    return {"image": _data_url(rgb)}
+        usage = _perfect_usage(entry)
+    return {"image": _data_url(rgb), "perfect": usage}
 
 
 @app.get("/api/sessions/{sid}/download")

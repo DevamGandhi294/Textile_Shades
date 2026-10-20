@@ -27,5 +27,20 @@ The website finds the API through `NEXT_PUBLIC_API_URL` in `frontend/.env.local`
 (see `frontend/.env.example`).
 
 ## Live site settings
-- Backend: set `ALLOWED_ORIGINS` to the website address (e.g. `https://yourapp.vercel.app`) so only your site can call it.
-- Frontend: set `NEXT_PUBLIC_API_URL` to the backend address, then build again.
+
+**Backend** (`backend/.env` on the server; see `backend/.env.example`):
+- `ALLOWED_ORIGINS` = the website address, e.g. `https://yourapp.vercel.app` (comma-separate several).
+  Without it the browser blocks every request from the live site.
+- `API_TOKEN` = a long random secret. It protects the paid "Make border perfect" call.
+- `OPENAI_API_KEY`, plus the optional limits `PERFECT_MAX_PER_SESSION` / `PERFECT_MAX_PER_HOUR`.
+
+**Frontend** (Vercel → Project → Settings → Environment Variables; see `frontend/.env.example`):
+- `NEXT_PUBLIC_API_URL` = the backend address (used by the browser).
+- `API_TOKEN` = the **same** secret as the backend. Server-only: never name it `NEXT_PUBLIC_…`.
+- Optional `BACKEND_URL` if the website's server reaches the backend on a different address.
+- Build again after changing them.
+
+How the paid call is protected: the browser calls `/api/perfect` on the website itself
+(`frontend/src/app/api/perfect/route.ts`). That server route checks the request comes from the
+website, checks the photo id, adds the secret token and calls the backend. The backend refuses
+calls without the token, and limits calls per photo and per hour.

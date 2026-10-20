@@ -1,5 +1,7 @@
 // Talks to the Python API in ../backend/api.py.
 // Set NEXT_PUBLIC_API_URL in .env.local (local) or in Vercel (live site).
+// The paid "Make border perfect" call does NOT go to the backend directly: it goes through this
+// website's own server route (src/app/api/perfect/route.ts), which adds the secret API_TOKEN.
 export const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 
 // Same fields as SettingsIn in backend/api.py (and CleanSettings / EvenSettings / OutputSettings).
@@ -21,6 +23,9 @@ export type Settings = {
   width_cm: number;
 };
 
+// Paid "Make border perfect" calls used for this photo, and the limit per photo.
+export type PerfectUsage = { used: number; limit: number };
+
 export type Result = {
   id: string;
   name: string;
@@ -37,6 +42,7 @@ export type Result = {
     seconds: Record<string, number>;
   };
   formats: string[];
+  perfect?: PerfectUsage;
 };
 
 export type Health = { ok: boolean; ai: boolean; ai_status: string; perfect?: boolean };
@@ -47,21 +53,59 @@ export class ApiError extends Error {
   }
 }
 
-async function call<T>(path: string, init: RequestInit): Promise<T> {
+// Plain names for the settings, used when the server rejects a value.
+const FIELD_NAMES: Record<string, string> = {
+  output: "Output",
+  method: "Line finder",
+  contrast: "Contrast",
+  sharpness: "Sharpness",
+  thickness: "Line thickness",
+  even_width: "Line width",
+  uniform_width: "Pen width",
+  beautify: "Beautify lines",
+  smooth: "Smooth and straighten",
+  color: "Line colour",
+  dpi: "DPI",
+  width_cm: "Width in cm",
+};
+
+type ValidationItem = { loc?: (string | number)[]; msg?: string };
+
+/** Turns the server's error body into one sentence a user can understand. */
+function errorMessage(body: unknown, status: number): string {
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  if (typeof detail === "string" && detail) return detail;
+  if (Array.isArray(detail) && detail.length) {
+    // FastAPI / pydantic validation errors: [{loc: ["body", "dpi"], msg: "..."}]
+    const parts = (detail as ValidationItem[]).map((d) => {
+      const field = String(d.loc?.[d.loc.length - 1] ?? "");
+      const name = FIELD_NAMES[field] ?? "A setting";
+      const msg = (d.msg ?? "is not allowed").replace(/^Input should be /, "should be ").replace(/^Value error, /, "");
+      return `${name} ${msg}`;
+    });
+    return `This setting is not allowed: ${parts.join("; ")}.`;
+  }
+  if (status === 429) return "This was used too often. Please wait a little and try again.";
+  if (status >= 500) return "The server had a problem. Please try again in a moment.";
+  return "Something went wrong. Please try again.";
+}
+
+async function readError(res: Response): Promise<ApiError> {
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {}
+  return new ApiError(errorMessage(body, res.status), res.status);
+}
+
+async function call<T>(url: string, init: RequestInit): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(API_URL + path, init);
+    res = await fetch(url, init);
   } catch {
     throw new ApiError("Could not reach the server. Please check your internet and try again.", 0);
   }
-  if (!res.ok) {
-    let msg = "Something went wrong. Please try again.";
-    try {
-      const body = await res.json();
-      if (typeof body.detail === "string") msg = body.detail;
-    } catch {}
-    throw new ApiError(msg, res.status);
-  }
+  if (!res.ok) throw await readError(res);
   return res.json();
 }
 
@@ -79,23 +123,51 @@ export function createSession(file: File, settings: Settings, autoCrop: boolean)
   form.append("file", file);
   form.append("auto_crop", String(autoCrop));
   form.append("settings", JSON.stringify(settings));
-  return call<Result>("/api/sessions", { method: "POST", body: form });
+  return call<Result>(`${API_URL}/api/sessions`, { method: "POST", body: form });
 }
 
 export function updateSession(id: string, settings: Settings) {
-  return call<Result>(`/api/sessions/${id}/update`, {
+  return call<Result>(`${API_URL}/api/sessions/${id}/update`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(settings),
   });
 }
 
-// "Make border perfect": OpenAI redraws the design as clean line art; returns the image as a data URL.
-// source "sketch" uses the original uploaded photo, "color" uses the scanned image.
-export function makePerfect(id: string, source: "sketch" | "color") {
-  return call<{ image: string }>(`/api/sessions/${id}/perfect?source=${source}`, { method: "POST" });
+// "Make border perfect": the AI redraws the scanned image as clean line art; returns the image as a data URL.
+// Goes through this website's server route, never to the backend directly (the token stays secret).
+export function makePerfect(id: string) {
+  const q = new URLSearchParams({ sid: id });
+  return call<{ image: string; perfect: PerfectUsage }>(`/api/perfect?${q}`, { method: "POST" });
 }
 
-export function downloadUrl(id: string, fmt: string) {
-  return `${API_URL}/api/sessions/${id}/download?fmt=${fmt}`;
+function fileNameFrom(res: Response, fallback: string) {
+  const cd = res.headers.get("Content-Disposition") ?? "";
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+  if (star) return decodeURIComponent(star[1]);
+  const plain = /filename="?([^";]+)"?/i.exec(cd);
+  return plain ? plain[1] : fallback;
+}
+
+/**
+ * Downloads one file (or the ZIP) and saves it. Errors such as "That size is too large"
+ * are thrown as ApiError so the page can show them, instead of opening a raw error page.
+ */
+export async function downloadFile(id: string, fmt: string, fallbackName: string) {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/api/sessions/${id}/download?fmt=${encodeURIComponent(fmt)}`);
+  } catch {
+    throw new ApiError("Could not reach the server. Please check your internet and try again.", 0);
+  }
+  if (!res.ok) throw await readError(res);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileNameFrom(res, fallbackName);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }

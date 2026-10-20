@@ -108,8 +108,11 @@ def test_perfect_per_session_limit():
     perfect.make_perfect = fake_perfect
     os.environ["PERFECT_MAX_PER_SESSION"] = "2"
     try:
-        codes = [client.post(f"/api/sessions/{sid}/perfect").status_code for _ in range(3)]
-        assert codes == [200, 200, 429], codes
+        replies = [client.post(f"/api/sessions/{sid}/perfect") for _ in range(3)]
+        assert [r.status_code for r in replies] == [200, 200, 429], [r.status_code for r in replies]
+        assert replies[1].json()["perfect"] == {"used": 2, "limit": 2}, replies[1].json()["perfect"]
+        r = client.post(f"/api/sessions/{sid}/update", json={"method": "classic"})
+        assert r.json()["perfect"] == {"used": 2, "limit": 2}, r.json()["perfect"]
         assert client.get(f"/api/sessions/{sid}/download", params={"fmt": "perfect"}).status_code == 200
     finally:
         perfect.make_perfect = real

@@ -1,9 +1,9 @@
 "use client";
 
-import { Play, RotateCcw } from "lucide-react";
+import { Play, RotateCcw, TriangleAlert } from "lucide-react";
 import { Checkbox, Radio, Section, SliderRow } from "./controls";
 import type { Settings } from "@/lib/api";
-import { ALL_FORMATS, DEFAULTS } from "@/lib/settings";
+import { ALL_FORMATS, DEFAULTS, LIMITS } from "@/lib/settings";
 
 type Props = {
   settings: Settings;
@@ -19,6 +19,7 @@ type Props = {
   waitingToStart: boolean;
   onStart: () => void;
   onReset: () => void;
+  sizeTooLarge?: boolean; // DPI x width gives files larger than the server allows
 };
 
 /** Every setting of the Python app (backend/app.py), in the same order and groups. */
@@ -165,16 +166,17 @@ export default function SettingsPanel(p: Props) {
             <input
               type="number"
               min={0}
+              max={LIMITS.widthCmMax}
               step={0.5}
               inputMode="decimal"
               value={s.width_cm}
               disabled={busy}
-              onChange={(e) => edit({ width_cm: Math.max(0, Number(e.target.value) || 0) })}
+              onChange={(e) => edit({ width_cm: Math.min(LIMITS.widthCmMax, Math.max(0, Number(e.target.value) || 0)) })}
               onBlur={() => apply()}
               onKeyDown={(e) => e.key === "Enter" && apply()}
               className="h-11 rounded-xl border border-line bg-white px-3"
             />
-            <span className="text-xs text-muted">0 = automatic</span>
+            <span className="text-xs text-muted">0 = automatic · up to {LIMITS.widthCmMax} cm</span>
           </label>
           <label className="flex flex-col gap-1.5">
             <span className="font-semibold">DPI</span>
@@ -192,6 +194,12 @@ export default function SettingsPanel(p: Props) {
             </select>
           </label>
         </div>
+        {p.sizeTooLarge && (
+          <p role="alert" className="flex items-start gap-2 rounded-xl bg-red-50 px-3 py-2.5 text-sm text-red-900">
+            <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+            That size is too large to download. Lower the DPI or the width.
+          </p>
+        )}
         <fieldset className="flex flex-col gap-1">
           <legend className="contents">
             <span className="font-semibold">Formats</span>
