@@ -40,7 +40,8 @@ The website finds the API through `NEXT_PUBLIC_API_URL` in `frontend/.env.local`
 - Optional `BACKEND_URL` if the website's server reaches the backend on a different address.
 - Build again after changing them.
 
-How the paid call is protected: the browser calls `/api/perfect` on the website itself
-(`frontend/src/app/api/perfect/route.ts`). That server route checks the request comes from the
+How the paid calls are protected: the browser calls `/api/perfect` and `/api/chat` on the website itself
+(`frontend/src/app/api/perfect/route.ts`, `frontend/src/app/api/chat/route.ts`, shared checks in
+`frontend/src/lib/gateway.ts`). That server route checks the request comes from the
 website, checks the photo id, adds the secret token and calls the backend. The backend refuses
 calls without the token, and limits calls per photo and per hour.

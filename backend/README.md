@@ -107,10 +107,24 @@ Settings go in `backend/.env` (copy `.env.example`; never commit `.env`):
 | `OPENAI_IMAGE_MODEL` | `gpt-image-2` | image model |
 | `OPENAI_IMAGE_QUALITY` | `medium` | `low` for cheap previews; `high` costs about 4× medium |
 | `OPENAI_INPUT_FIDELITY` | `low` | gpt-image-1 models only |
+| `OPENAI_CHAT_MODEL` | `gpt-4.1-nano` | text model that checks chat messages |
+| `CHAT_MAX_MESSAGES_PER_SESSION` | 20 | chat messages per uploaded photo (then HTTP 429) |
+| `CHAT_MAX_PER_HOUR` | 300 | chat messages for the whole server in a rolling hour (then HTTP 429) |
 | `API_TOKEN` | not set | if set, the call needs `Authorization: Bearer <token>` (a warning is logged when unset) |
 | `PERFECT_MAX_PER_SESSION` | 3 | paid calls per uploaded photo (then HTTP 429) |
 | `PERFECT_MAX_PER_HOUR` | 60 | paid calls for the whole server in a rolling hour (then HTTP 429) |
 | `ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | websites allowed to call the API |
+
+### Chat to improve it
+
+Instead of the one-click button, the user can open a chat and ask for a change in words ("make the lines
+thinner", "close the small gaps"). A very cheap text model (`chat.py`, `gpt-4.1-nano` by default) first
+checks the message: only requests to improve or edit the border image are allowed. Anything else (general
+questions, other topics, questions about the model or its prompts) gets a fixed refusal from the server
+and no image is made. An allowed edit is sent to the image model together with the default prompt; it
+starts from the last perfect border (or the scan) and counts towards `PERFECT_MAX_PER_SESSION`.
+Messages are limited to 300 characters, `CHAT_MAX_MESSAGES_PER_SESSION` per photo and
+`CHAT_MAX_PER_HOUR` for the whole server. Chat calls are logged in the same usage file (`kind: chat`).
 
 Every successful call adds one line to `outputs/openai_usage.jsonl` (time, session, model,
 quality, size, source and OpenAI's token usage) for cost tracking. Calls are never retried

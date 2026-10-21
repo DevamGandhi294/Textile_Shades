@@ -43,6 +43,7 @@ export type Result = {
   };
   formats: string[];
   perfect?: PerfectUsage;
+  chat?: PerfectUsage; // chat messages used for this photo
 };
 
 export type Health = { ok: boolean; ai: boolean; ai_status: string; perfect?: boolean };
@@ -139,6 +140,19 @@ export function updateSession(id: string, settings: Settings) {
 export function makePerfect(id: string) {
   const q = new URLSearchParams({ sid: id });
   return call<{ image: string; perfect: PerfectUsage }>(`/api/perfect?${q}`, { method: "POST" });
+}
+
+// "Chat to improve it": the user asks for a change in words. The server only accepts requests to improve
+// or edit the border image; anything else comes back as a fixed refusal with no image.
+export type ChatAnswer = { reply: string; image: string | null; perfect: PerfectUsage; chat: PerfectUsage };
+
+export function sendChat(id: string, message: string) {
+  const q = new URLSearchParams({ sid: id });
+  return call<ChatAnswer>(`/api/chat?${q}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
 }
 
 function fileNameFrom(res: Response, fallback: string) {

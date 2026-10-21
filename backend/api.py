@@ -10,6 +10,7 @@ uploaded image; the Session is kept in memory so a settings change only re-runs 
     POST /api/sessions                  upload a photo  -> id + previews
     POST /api/sessions/{id}/update      new settings    -> previews
     POST /api/sessions/{id}/perfect     ?source=sketch|color  -> AI redraw (paid, limited; see README)
+    POST /api/sessions/{id}/chat        {message}  -> ask for a change in words (image edits only)
     GET  /api/sessions/{id}/download    ?fmt=zip|png|pdf|svg|eps|dxf|tiff|bmp|perfect
     GET  /api/health
 """
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 import cv2
+import numpy as np
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -41,9 +43,11 @@ from pydantic import BaseModel, Field, ValidationError
 
 from sketchclean import CleanSettings, EvenSettings, OutputSettings, Session, Settings
 from sketchclean import ai
+import chat
 import perfect
 
 HERE = Path(__file__).resolve().parent
+CHAT_MAX_CHARS = 300                              # longest chat message (also checked by the website)
 USAGE_LOG = HERE / "outputs" / "openai_usage.jsonl"     # one line per paid OpenAI call (cost tracking)
 
 log = logging.getLogger("textileborder.api")
@@ -110,13 +114,16 @@ class Entry:
         self.lock = threading.Lock()         # one change at a time per image
         self.used = time.time()
         self.perfect = None                  # PNG from "Make border perfect"
-        self.perfect_calls = 0               # paid calls used (or running) for this photo
+        self.perfect_calls = 0               # paid image calls used (or running) for this photo
+        self.chat_calls = 0                  # chat messages used for this photo
+        self.chat_history = []               # last on-topic turns, so "make it thinner" follows the last change
 
 
 _sessions: "OrderedDict[str, Entry]" = OrderedDict()
 _store_lock = threading.Lock()
 
-_perfect_times: deque = deque()                # start times of paid calls in the last hour (all sessions)
+_perfect_times: deque = deque()                # start times of paid image calls in the last hour (all sessions)
+_chat_times: deque = deque()                   # start times of chat messages in the last hour (all sessions)
 _perfect_lock = threading.Lock()
 
 
@@ -127,25 +134,33 @@ def _env_int(name, default):
         return default
 
 
-def _reserve_hourly():
-    """Take one slot of PERFECT_MAX_PER_HOUR (rolling hour). Returns its timestamp, or None if full."""
+def _reserve(times, env_name, default):
+    """Take one slot of a rolling-hour limit. Returns its timestamp, or None if the hour is full."""
     now = time.time()
     with _perfect_lock:
-        while _perfect_times and now - _perfect_times[0] > 3600:
-            _perfect_times.popleft()
-        if len(_perfect_times) >= _env_int("PERFECT_MAX_PER_HOUR", 60):
+        while times and now - times[0] > 3600:
+            times.popleft()
+        if len(times) >= _env_int(env_name, default):
             return None
-        _perfect_times.append(now)
+        times.append(now)
         return now
 
 
-def _release_hourly(stamp):
+def _release(times, stamp):
     """Give a slot back when the paid call failed."""
     with _perfect_lock:
         try:
-            _perfect_times.remove(stamp)
+            times.remove(stamp)
         except ValueError:
             pass
+
+
+def _reserve_hourly():
+    return _reserve(_perfect_times, "PERFECT_MAX_PER_HOUR", 60)
+
+
+def _release_hourly(stamp):
+    _release(_perfect_times, stamp)
 
 
 def _log_usage(sid, source, meta):
@@ -153,8 +168,8 @@ def _log_usage(sid, source, meta):
     try:
         USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
         line = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"), "session": sid,
-                "model": meta.get("model"), "quality": meta.get("quality"), "size": meta.get("size"),
-                "source": source, "usage": meta.get("usage")}
+                "kind": meta.get("kind", "image"), "model": meta.get("model"), "quality": meta.get("quality"),
+                "size": meta.get("size"), "source": source, "usage": meta.get("usage")}
         with open(USAGE_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(line) + "\n")
     except Exception:
@@ -227,12 +242,25 @@ def _result(sid: str, entry: Entry):
         },
         "formats": ["zip", "png", "tiff", "bmp"] + (["svg", "pdf", "eps", "dxf"] if s.even is not None else []),
         "perfect": _perfect_usage(entry),
+        "chat": _chat_usage(entry),
     }
 
 
 def _perfect_usage(entry: Entry):
     """Paid 'Make border perfect' calls used for this photo and the limit, so the website can show them."""
     return {"used": entry.perfect_calls, "limit": _env_int("PERFECT_MAX_PER_SESSION", 3)}
+
+
+def _chat_usage(entry: Entry):
+    """Chat messages used for this photo and the limit."""
+    return {"used": entry.chat_calls, "limit": _env_int("CHAT_MAX_MESSAGES_PER_SESSION", 20)}
+
+
+def _require_token(authorization):
+    """Paid calls need "Authorization: Bearer <API_TOKEN>" when API_TOKEN is set."""
+    token = os.environ.get("API_TOKEN")
+    if token and not hmac.compare_digest((authorization or "").encode(), f"Bearer {token}".encode()):
+        raise HTTPException(401, "Not allowed: missing or wrong API token.")
 
 
 # ----------------------------------------------------------------- app
@@ -291,28 +319,23 @@ def update_session(sid: str, settings: SettingsIn):
         return _result(sid, entry)
 
 
-@app.post("/api/sessions/{sid}/perfect")
-def make_perfect(sid: str, source: str = "sketch", authorization: Optional[str] = Header(None)):
-    """'Make border perfect': an OpenAI image model (gpt-image-2 by default, see OPENAI_IMAGE_MODEL;
-    medium quality, see OPENAI_IMAGE_QUALITY) redraws the design as clean line art.
-    Both sources send the scanned image (checkpoint 1); source is kept for the usage log.
-    Paid: needs API_TOKEN (if set), and is limited per photo and per hour."""
-    token = os.environ.get("API_TOKEN")
-    if token and not hmac.compare_digest((authorization or "").encode(), f"Bearer {token}".encode()):
-        raise HTTPException(401, "Not allowed: missing or wrong API token.")
-    if source not in ("sketch", "color"):
-        raise HTTPException(422, "source must be 'sketch' or 'color'")
-    entry = _get(sid)
-
+def _paid_redraw(sid, entry, source, extra=None, refine=False):
+    """One paid image call. refine=False redraws the scanned image; refine=True (chat) starts from the
+    last perfect border when there is one. Limits: PERFECT_MAX_PER_SESSION and PERFECT_MAX_PER_HOUR."""
+    max_per_session = _env_int("PERFECT_MAX_PER_SESSION", 3)
     # copy what the call needs and reserve this photo's slot, then let go of the lock:
     # the paid call can take a minute and must not block other requests for this photo
-    max_per_session = _env_int("PERFECT_MAX_PER_SESSION", 3)
     with entry.lock:
         if entry.perfect_calls >= max_per_session:
             raise HTTPException(429, f"Make border perfect can be used {max_per_session} times per photo. "
                                      "Upload the photo again to try more.")
         s = entry.sess
-        picture = s.preview_scan().copy()     # the scanned image (checkpoint 1) for both Sketch and Coloured design
+        if refine and entry.perfect is not None and entry.perfect.exists():
+            picture = np.asarray(Image.open(entry.perfect).convert("RGB")).copy()
+        else:
+            picture = s.preview_scan().copy()     # the scanned image (checkpoint 1)
+            if not refine:
+                entry.chat_history = []           # a fresh redraw starts a new conversation
         color, dpi = s.settings.output.color, s.settings.output.dpi
         entry.perfect_calls += 1
     stamp = _reserve_hourly()
@@ -323,7 +346,7 @@ def make_perfect(sid: str, source: str = "sketch", authorization: Optional[str] 
                                  "Please try again later.")
 
     try:
-        rgb, meta = perfect.make_perfect(picture, source, color)
+        rgb, meta = perfect.make_perfect(picture, "sketch" if source == "chat" else source, color, extra)  # one prompt for all
     except perfect.PerfectError as e:
         with entry.lock:
             entry.perfect_calls -= 1          # nothing was made, so the slot is given back
@@ -338,7 +361,77 @@ def make_perfect(sid: str, source: str = "sketch", authorization: Optional[str] 
         Image.fromarray(rgb, "RGB").save(path, dpi=(dpi, dpi))
         entry.perfect = path
         usage = _perfect_usage(entry)
+    return rgb, usage
+
+
+@app.post("/api/sessions/{sid}/perfect")
+def make_perfect(sid: str, source: str = "sketch", authorization: Optional[str] = Header(None)):
+    """'Make border perfect': an OpenAI image model (gpt-image-2 by default, see OPENAI_IMAGE_MODEL;
+    medium quality, see OPENAI_IMAGE_QUALITY) redraws the design as clean line art.
+    Both sources send the scanned image (checkpoint 1); source is kept for the usage log.
+    Paid: needs API_TOKEN (if set), and is limited per photo and per hour."""
+    _require_token(authorization)
+    if source not in ("sketch", "color"):
+        raise HTTPException(422, "source must be 'sketch' or 'color'")
+    entry = _get(sid)
+    rgb, usage = _paid_redraw(sid, entry, source)
     return {"image": _data_url(rgb), "perfect": usage}
+
+
+class ChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=CHAT_MAX_CHARS)
+
+
+@app.post("/api/sessions/{sid}/chat")
+def chat_edit(sid: str, body: ChatIn, authorization: Optional[str] = Header(None)):
+    """'Chat to perfect': the user asks for a change in words. A cheap text model (chat.py) checks that
+    it is a request to improve or edit the border image; anything else gets a fixed refusal and costs
+    no image. An allowed edit is applied by the image model to the last perfect border (or the scan).
+    Paid: needs API_TOKEN (if set); limited per photo (CHAT_MAX_MESSAGES_PER_SESSION, and the image
+    limit above) and per hour (CHAT_MAX_PER_HOUR)."""
+    _require_token(authorization)
+    message = " ".join(body.message.split())
+    if not message:
+        raise HTTPException(422, "Please type a message.")
+    entry = _get(sid)
+
+    max_messages = _env_int("CHAT_MAX_MESSAGES_PER_SESSION", 20)
+    with entry.lock:
+        if entry.chat_calls >= max_messages:
+            raise HTTPException(429, f"You can send {max_messages} chat messages per photo. "
+                                     "Upload the photo again to continue.")
+        entry.chat_calls += 1
+        history = list(entry.chat_history)
+    stamp = _reserve(_chat_times, "CHAT_MAX_PER_HOUR", 300)
+    if stamp is None:
+        with entry.lock:
+            entry.chat_calls -= 1
+        raise HTTPException(429, "The chat has been used too often in the last hour. Please try again later.")
+
+    try:
+        verdict = chat.classify(message, history)
+    except chat.ChatError as e:
+        with entry.lock:
+            entry.chat_calls -= 1             # nothing was answered, so the slot is given back
+        _release(_chat_times, stamp)
+        raise HTTPException(502, str(e))
+    _log_usage(sid, "chat", {"kind": "chat", "model": verdict["model"], "usage": verdict["usage"]})
+
+    if not verdict["on_topic"]:
+        with entry.lock:
+            usage, chat_usage = _perfect_usage(entry), _chat_usage(entry)
+        return {"reply": chat.REFUSAL, "image": None, "perfect": usage, "chat": chat_usage}
+
+    reply = verdict["reply"] or "Okay."
+    image, instruction = None, verdict["edit_instruction"]
+    if instruction:
+        rgb, _ = _paid_redraw(sid, entry, "chat", extra=instruction, refine=True)
+        image = _data_url(rgb)
+    with entry.lock:
+        entry.chat_history = (entry.chat_history + [{"role": "user", "content": message[:CHAT_MAX_CHARS]},
+                                                    {"role": "assistant", "content": reply}])[-6:]
+        usage, chat_usage = _perfect_usage(entry), _chat_usage(entry)
+    return {"reply": reply, "image": image, "perfect": usage, "chat": chat_usage}
 
 
 @app.get("/api/sessions/{sid}/download")

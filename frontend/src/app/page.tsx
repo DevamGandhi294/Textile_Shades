@@ -19,8 +19,8 @@ import {
 } from "lucide-react";
 import SettingsPanel from "@/components/SettingsPanel";
 import { Button, ChoiceCard, Modal, Spinner } from "@/components/controls";
-import { ApiError, createSession, downloadFile, getHealth, makePerfect, updateSession, type Result, type Settings } from "@/lib/api";
-import { ALL_FORMATS, DEFAULTS, FORMATS, isDefault, outputTooLarge } from "@/lib/settings";
+import { ApiError, createSession, downloadFile, getHealth, makePerfect, sendChat, updateSession, type Result, type Settings } from "@/lib/api";
+import { ALL_FORMATS, DEFAULTS, FORMATS, LIMITS, isDefault, outputTooLarge } from "@/lib/settings";
 
 const VIEWS = [
   { key: "scan", label: "Scanned" },
@@ -51,13 +51,17 @@ export default function Home() {
   const [settings, setSettings] = useState<Settings>(DEFAULTS);
   const [autoCrop, setAutoCrop] = useState(true);
   const [formats, setFormats] = useState<string[]>(ALL_FORMATS);
-  const [busy, setBusy] = useState<"" | "upload" | "update" | "perfect">("");
+  const [busy, setBusy] = useState<"" | "upload" | "update" | "perfect" | "chat">("");
   const [seconds, setSeconds] = useState(0);
   const [error, setError] = useState("");
   const [view, setView] = useState<View>("final");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [downloading, setDownloading] = useState(""); // file type being prepared for download
+  const [chatOpen, setChatOpen] = useState(false); // "Chat to improve it" panel
+  const [chatLog, setChatLog] = useState<ChatLine[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const chatBoxRef = useRef<HTMLDivElement>(null);
 
   const latest = useRef(settings); // newest settings, also while a slider is moving
   const sent = useRef(""); // settings the server last processed, to skip repeat calls
@@ -118,6 +122,11 @@ export default function Home() {
 
   useEffect(() => () => void (photoUrl && URL.revokeObjectURL(photoUrl)), [photoUrl]);
 
+  useEffect(() => {
+    const box = chatBoxRef.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [chatLog, busy, chatOpen]);
+
   // ------------------------------------------------------------------ welcome popup answers
 
   function welcomeRecommended() {
@@ -138,6 +147,8 @@ export default function Home() {
     setPhotoUrl(URL.createObjectURL(f));
     setResult(null);
     setPerfectImg(null);
+    setChatLog([]);
+    setChatOpen(false);
     setError("");
     setWaiting(true);
     setAsking(true); // always ask before any processing starts
@@ -256,11 +267,43 @@ export default function Home() {
     }
   }
 
+  // "Chat to improve it": one message. The server checks it is about editing the border image;
+  // an allowed edit comes back with a new Perfect border, anything else with a short refusal.
+  async function sendMessage(text: string) {
+    const message = text.trim().slice(0, LIMITS.chatMaxChars);
+    if (!message || !result || busy) return;
+    setError("");
+    setChatInput("");
+    setChatLog((l) => [...l, { role: "user", text: message }]);
+    setBusy("chat");
+    try {
+      const answer = await sendChat(result.id, message);
+      setChatLog((l) => [...l, { role: "assistant", text: answer.reply }]);
+      setResult((r) => (r ? { ...r, perfect: answer.perfect, chat: answer.chat } : r));
+      if (answer.image) {
+        setPerfectImg(answer.image);
+        setView("perfect");
+      }
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      // a limit was reached: show that counter as full so the box says so
+      if (e instanceof ApiError && e.status === 429) {
+        const which = reason.includes("chat messages") ? "chat" : reason.includes("Make border perfect") ? "perfect" : null;
+        if (which) setResult((r) => (r?.[which] ? { ...r, [which]: { ...r[which], used: r[which].limit } } : r));
+      }
+      setChatLog((l) => [...l, { role: "assistant", text: reason, error: true }]);
+    } finally {
+      setBusy("");
+    }
+  }
+
   function startOver() {
     setFile(null);
     setPhotoUrl(null);
     setResult(null);
     setPerfectImg(null);
+    setChatLog([]);
+    setChatOpen(false);
     setWaiting(false);
     setError("");
   }
@@ -274,6 +317,8 @@ export default function Home() {
   const tooLarge = !!result && outputTooLarge(result.info.width, result.info.height, settings);
   const usage = result?.perfect;
   const perfectUsedUp = !!usage && usage.used >= usage.limit;
+  const chatUsage = result?.chat;
+  const chatUsedUp = !!chatUsage && chatUsage.used >= chatUsage.limit;
 
   // Save one file; errors (for example "That size is too large") are shown on the page.
   async function save(fmt: string, ext: string) {
@@ -511,26 +556,115 @@ export default function Home() {
               </div>
               <Summary result={result} />
               {perfectReady && (
-                <div className="flex flex-col items-start gap-3 rounded-2xl border border-brand/40 bg-mint-soft p-4 sm:flex-row sm:items-center">
-                  <div className="flex flex-1 flex-col gap-1">
+                <div className="flex flex-col gap-3 rounded-2xl border border-brand/40 bg-mint-soft p-4">
+                  <div className="flex flex-col gap-1">
                     <p className="font-semibold">Make this perfect outline border</p>
                     <p className="text-sm text-muted">
-                      Use this button to get a clean, smooth outline of your design. The result appears as “Perfect border”
-                      next to Final result.
+                      Get a clean, smooth outline of your design. The result appears as “Perfect border” next to Final
+                      result. Choose how:
                     </p>
                   </div>
-                  <div className="flex flex-col items-start gap-1 sm:items-end">
-                    <Button onClick={runPerfect} disabled={!!busy || perfectUsedUp}>
-                      {perfectImg ? "Make it again" : "Make perfect outline border"}
-                    </Button>
-                    {usage && (
-                      <span className="text-xs text-muted">
-                        {perfectUsedUp
-                          ? "Limit reached for this photo. Upload it again to try more."
-                          : `Used ${usage.used} of ${usage.limit} for this photo`}
-                      </span>
-                    )}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="flex flex-col gap-1">
+                      <Button onClick={runPerfect} disabled={!!busy || perfectUsedUp}>
+                        {perfectImg ? "Make it again" : "Make perfect outline border"}
+                      </Button>
+                      <span className="text-xs text-muted">One click. Uses our default settings.</span>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <Button kind="outline" onClick={() => setChatOpen((o) => !o)} disabled={busy === "perfect"}>
+                        {chatOpen ? "Close chat" : "Chat to improve it"}
+                      </Button>
+                      <span className="text-xs text-muted">Tell us what to change, in your own words.</span>
+                    </div>
                   </div>
+                  {usage && (
+                    <span className="text-xs text-muted">
+                      {perfectUsedUp
+                        ? "Image limit reached for this photo. Upload it again to try more."
+                        : `Images used ${usage.used} of ${usage.limit} for this photo`}
+                    </span>
+                  )}
+
+                  {chatOpen && (
+                    <div className="flex flex-col gap-3 rounded-xl bg-white p-3">
+                      <p className="text-sm text-muted">
+                        You can ask only for changes to your border image, for example “make the lines thinner”, “close the
+                        small gaps” or “remove the dots”. Other questions will not be answered.
+                      </p>
+                      <div
+                        ref={chatBoxRef}
+                        role="log"
+                        aria-live="polite"
+                        className="flex max-h-72 min-h-24 flex-col gap-2 overflow-y-auto rounded-lg bg-gray-50 p-3"
+                      >
+                        {chatLog.length === 0 && busy !== "chat" && (
+                          <p className="text-sm text-muted">No messages yet. Type what you want to change, or tap an example.</p>
+                        )}
+                        {chatLog.map((m, i) => (
+                          <div
+                            key={i}
+                            className={`max-w-[85%] rounded-2xl px-3 py-2 text-sm ${
+                              m.role === "user"
+                                ? "self-end bg-btn text-white"
+                                : m.error
+                                  ? "self-start bg-red-50 text-red-900"
+                                  : "self-start border border-line bg-white text-ink"
+                            }`}
+                          >
+                            {m.text}
+                          </div>
+                        ))}
+                        {busy === "chat" && (
+                          <div className="self-start rounded-2xl border border-line bg-white px-3 py-2 text-sm text-muted">
+                            Working on it… {seconds} s
+                            <span className="block text-xs">Changing the image can take up to a minute.</span>
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {["Make the lines thinner", "Close the small gaps", "Remove the small dots"].map((example) => (
+                          <button
+                            key={example}
+                            type="button"
+                            onClick={() => setChatInput(example)}
+                            disabled={!!busy || chatUsedUp}
+                            className="rounded-full border border-line bg-white px-3 py-1 text-xs hover:bg-gray-100 disabled:opacity-50"
+                          >
+                            {example}
+                          </button>
+                        ))}
+                      </div>
+                      <form
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          sendMessage(chatInput);
+                        }}
+                        className="flex gap-2"
+                      >
+                        <input
+                          type="text"
+                          value={chatInput}
+                          maxLength={LIMITS.chatMaxChars}
+                          onChange={(e) => setChatInput(e.target.value)}
+                          disabled={!!busy || chatUsedUp}
+                          placeholder="Type what you want to change…"
+                          aria-label="Your message"
+                          className="h-11 min-w-0 flex-1 rounded-xl border border-line bg-white px-3 disabled:opacity-50"
+                        />
+                        <Button onClick={() => sendMessage(chatInput)} disabled={!!busy || chatUsedUp || !chatInput.trim()}>
+                          Send
+                        </Button>
+                      </form>
+                      {chatUsage && (
+                        <span className="text-xs text-muted">
+                          {chatUsedUp
+                            ? "Message limit reached for this photo. Upload it again to continue."
+                            : `Messages used ${chatUsage.used} of ${chatUsage.limit} for this photo`}
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </Card>
@@ -726,6 +860,8 @@ export default function Home() {
     </>
   );
 }
+
+type ChatLine = { role: "user" | "assistant"; text: string; error?: boolean };
 
 function DownloadIcon({ busy, className }: { busy: boolean; className: string }) {
   return busy ? (

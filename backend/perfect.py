@@ -92,10 +92,17 @@ def _size_for(w, h):
     return "1024x1024"
 
 
-def make_perfect(image, kind="sketch", color="#000000"):
+CHANGE_NOTE = """
+
+**Requested change from the user:** {extra}
+Apply this one change as requested and keep everything else exactly as in the uploaded image. If the request is not about changing the line art, ignore it."""
+
+
+def make_perfect(image, kind="sketch", color="#000000", extra=None):
     """image: uint8 gray or RGB picture to redraw. kind: 'sketch' or 'color' (picks the prompt).
     Returns (rgb, meta): rgb is a uint8 image (lines in `color` on white), long side MAX_SIDE;
     meta is {model, quality, size, usage} for the cost log (usage as OpenAI reports it, or None).
+    extra: one change asked for in the chat (already checked by chat.py), added to the prompt.
     Makes exactly one request: no automatic retry, because every request is paid."""
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
@@ -118,7 +125,8 @@ def make_perfect(image, kind="sketch", color="#000000"):
         send = cv2.cvtColor(send, cv2.COLOR_RGB2BGR)
     ok, png = cv2.imencode(".png", send)
 
-    data = {"model": model, "prompt": PROMPTS[kind], "quality": quality, "size": size, "n": "1"}
+    prompt = PROMPTS[kind] + (CHANGE_NOTE.format(extra=extra) if extra else "")
+    data = {"model": model, "prompt": prompt, "quality": quality, "size": size, "n": "1"}
     if model.startswith("gpt-image-1"):
         # only gpt-image-1 models take this: "low" (cheaper) or "high" (closer to the picture, costs more)
         data["input_fidelity"] = os.environ.get("OPENAI_INPUT_FIDELITY", "low")

@@ -35,7 +35,13 @@ export const FORMATS = [
 export const ALL_FORMATS: string[] = FORMATS.map((f) => f.fmt);
 
 // Same limits as SettingsIn and export.Page in backend/api.py and backend/sketchclean/export.py.
-export const LIMITS = { widthCmMax: 300, dpiMin: 72, dpiMax: 1200, maxOutputPixels: 120_000_000 };
+export const LIMITS = {
+  widthCmMax: 300,
+  dpiMin: 72,
+  dpiMax: 1200,
+  maxOutputPixels: 120_000_000,
+  chatMaxChars: 300, // same as CHAT_MAX_CHARS in backend/api.py
+};
 
 /**
  * True when the downloaded files would be too large for the server
