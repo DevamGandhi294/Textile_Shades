@@ -303,6 +303,278 @@ def test_chat_classify_request_and_parsing():
         pass
 
 
+# ----------------------------------------------------------------- 5. Colour layers
+
+COLOUR_SAMPLE = ROOT / "samples" / "07_color_border.jpg"
+
+
+def new_colour_session(settings=CLASSIC):
+    with open(COLOUR_SAMPLE, "rb") as f:
+        r = client.post("/api/sessions", files={"file": (COLOUR_SAMPLE.name, f, "image/jpeg")}, data={"settings": settings})
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+def test_layers_find_the_colours_of_the_design():
+    sid = new_colour_session()
+    r = client.post(f"/api/sessions/{sid}/layers", json={})
+    assert r.status_code == 200, r.text
+    names = {e["name"] for e in r.json()["palette"]}
+    assert names == {"Pink", "Orange", "Green", "Yellow"}, names
+    assert r.json()["image"].startswith("data:image/png")
+    assert abs(sum(e["share"] for e in r.json()["palette"]) - 1) < 1e-6
+
+
+def test_layers_number_of_colours_merge_and_hide():
+    sid = new_colour_session()
+    url = f"/api/sessions/{sid}/layers"
+    full = client.post(url, json={}).json()
+    assert len(client.post(url, json={"colors": 2}).json()["palette"]) == 2
+    pink = next(e["id"] for e in full["palette"] if e["name"] == "Pink")
+    orange = next(e["id"] for e in full["palette"] if e["name"] == "Orange")
+    merged = client.post(url, json={"merge": [[orange, pink]]}).json()["palette"]
+    assert len(merged) == len(full["palette"]) - 1, merged
+    hidden = client.post(url, json={"hidden": [pink]}).json()
+    assert hidden["image"] != full["image"], "hiding a layer must change the preview"
+    assert [e["id"] for e in hidden["palette"]] == [e["id"] for e in full["palette"]], "hiding keeps the layer list"
+
+
+def test_a_pencil_sketch_has_no_colour_layers():
+    """Tinted paper and shadows are not colours: a grey sketch gets an empty layer list, not false layers."""
+    with open(ROOT / "samples" / "05_peacock_phone_photo.jpg", "rb") as f:
+        sid = client.post("/api/sessions", files={"file": ("p.jpg", f, "image/jpeg")}, data={"settings": CLASSIC}).json()["id"]
+    r = client.post(f"/api/sessions/{sid}/layers", json={})
+    assert r.status_code == 200 and r.json()["palette"] == [], r.text[:200]
+    assert client.get(f"/api/sessions/{sid}/download", params={"fmt": "layers-svg"}).status_code == 400
+
+
+def test_layers_bad_input_is_rejected():
+    sid = new_colour_session()
+    url = f"/api/sessions/{sid}/layers"
+    for bad in ({"colors": 99}, {"colors": -1}, {"merge": [[0, 99]]}, {"merge": [[0]]}, {"hidden": [-1]}, {"colors": "many"}):
+        assert client.post(url, json=bad).status_code == 422, bad
+
+
+def test_layers_need_black_and_white_output():
+    sid = new_colour_session('{"method": "classic", "output": "scan"}')
+    r = client.post(f"/api/sessions/{sid}/layers", json={})
+    assert r.status_code == 400 and "Black & white" in r.json()["detail"], r.text
+
+
+def test_layers_svg_download_has_a_group_per_colour():
+    sid = new_colour_session()
+    client.post(f"/api/sessions/{sid}/layers", json={})
+    r = client.get(f"/api/sessions/{sid}/download", params={"fmt": "layers-svg"})
+    assert r.status_code == 200 and "_layers.svg" in r.headers["content-disposition"], r.text[:200]
+    text = r.text
+    assert text.count('inkscape:groupmode="layer"') == 5, text.count('inkscape:groupmode="layer"')   # 4 colours + lines
+    for label in ("01 Pink", "Lines"):
+        assert f'inkscape:label="{label}"' in text, label
+    assert text.count("<path") >= 5, text.count("<path")                 # a path per colour + the lines
+
+
+def test_layers_zip_download_has_transparent_png_layers():
+    import io
+    import zipfile
+
+    from PIL import Image
+
+    sid = new_colour_session()
+    r = client.get(f"/api/sessions/{sid}/download", params={"fmt": "layers-zip"})
+    assert r.status_code == 200, r.text[:200]
+    z = zipfile.ZipFile(io.BytesIO(r.content))
+    names = z.namelist()
+    assert "lines.png" in names and "composite.png" in names and len([n for n in names if n[:2].isdigit()]) == 4, names
+    sizes = set()
+    for name in names:
+        im = Image.open(io.BytesIO(z.read(name)))
+        assert im.mode == "RGBA", name
+        sizes.add(im.size)
+    assert len(sizes) == 1, f"all layer images must have the same size: {sizes}"
+    first = Image.open(io.BytesIO(z.read(sorted(n for n in names if n[:2].isdigit())[0])))
+    assert first.getchannel("A").getextrema() == (0, 255), "a layer is transparent except where it has colour"
+
+
+def test_layers_download_respects_the_size_limit():
+    sid = new_colour_session('{"method": "classic", "dpi": 1200, "width_cm": 300}')
+    r = client.get(f"/api/sessions/{sid}/download", params={"fmt": "layers-svg"})
+    assert r.status_code == 422 and "too large" in r.json()["detail"], r.text
+
+
+def test_colour_names_are_plain_words():
+    from sketchclean.layers import colour_name
+    assert colour_name((226, 112, 160)) == "Pink" and colour_name((70, 150, 84)) == "Green"
+    assert colour_name((240, 150, 60)) == "Orange" and colour_name((250, 250, 250)) == "White"
+    assert colour_name((40, 40, 40)) == "Black" and colour_name((140, 140, 140)) == "Grey"
+
+
+# ----------------------------------------------------------------- 6. Perfect border is lines on transparent
+
+def lines_on_white(picture, kind="sketch", color="#000000", extra=None):
+    """Stand-in for the AI: a black bar on white paper, at the size of the picture."""
+    rgb = np.full(picture.shape[:2] + (3,), 255, np.uint8)
+    h, w = rgb.shape[:2]
+    rgb[h // 2 - 8:h // 2 + 8, w // 10:w * 9 // 10] = 0
+    return rgb, {"model": "fake", "usage": None}
+
+
+def test_perfect_download_is_black_lines_on_transparent():
+    import io
+
+    from PIL import Image
+
+    real = perfect.make_perfect
+    seen = []
+
+    def fake(picture, kind="sketch", color="#000000", extra=None):
+        seen.append(picture)
+        return lines_on_white(picture, kind, color, extra)
+
+    perfect.make_perfect = fake
+    chat_real = chat.classify
+    chat.classify = lambda message, history=(): dict(ON_TOPIC)
+    api._perfect_times.clear()
+    api._chat_times.clear()
+    try:
+        sid = new_session()
+        assert client.post(f"/api/sessions/{sid}/perfect").status_code == 200
+        r = client.get(f"/api/sessions/{sid}/download", params={"fmt": "perfect"})
+        im = Image.open(io.BytesIO(r.content))
+        assert im.mode == "RGBA", im.mode
+        rgba = np.asarray(im)
+        assert rgba[..., 3].min() == 0 and rgba[..., 3].max() == 255, "paper must be transparent, lines opaque"
+        assert (rgba[rgba[..., 3] == 255][:, :3] == 0).all(), "the opaque pixels are the black lines"
+        # the next chat edit starts from this picture, which must go back onto white paper (not black)
+        assert client.post(f"/api/sessions/{sid}/chat", json={"message": "thinner"}).status_code == 200
+        assert seen[-1].mean() > 200, "the last perfect border was sent as a black picture"
+    finally:
+        perfect.make_perfect, chat.classify = real, chat_real
+        api._perfect_times.clear()
+        api._chat_times.clear()
+        api.USAGE_LOG.unlink(missing_ok=True)
+
+
+def test_make_perfect_has_soft_edges_and_the_line_colour():
+    import base64
+
+    import cv2
+
+    bar = np.full((1536, 1024), 255, np.uint8)
+    bar[700:740, 100:900] = 0
+    bar = cv2.GaussianBlur(bar, (0, 0), 1.5)                          # a soft edge, like an anti-aliased line
+    png = base64.b64encode(cv2.imencode(".png", bar)[1].tobytes()).decode()
+
+    class Answer:
+        status_code, text = 200, ""
+
+        def json(self):
+            return {"data": [{"b64_json": png}], "usage": {"total_tokens": 1}}
+
+    real_post, real_key = perfect.httpx.post, os.environ.get("OPENAI_API_KEY")
+    perfect.httpx.post, os.environ["OPENAI_API_KEY"] = (lambda *a, **k: Answer()), "sk-test"
+    try:
+        rgb, meta = perfect.make_perfect(np.full((300, 200, 3), 255, np.uint8), "sketch", "#1d4ed8")
+    finally:
+        perfect.httpx.post = real_post
+        os.environ.pop("OPENAI_API_KEY", None) if real_key is None else os.environ.__setitem__("OPENAI_API_KEY", real_key)
+    assert max(rgb.shape[:2]) == 2400 and rgb.shape[2] == 3, rgb.shape
+    ink = (rgb == (29, 78, 216)).all(axis=2)
+    assert ink.any(), "fully inked pixels have exactly the line colour"
+    middle_column = rgb[:, rgb.shape[1] // 2]
+    assert len({tuple(px) for px in middle_column}) > 2, "the edge is soft, not a hard black/white cut"
+    rgba = perfect.to_transparent(rgb, "#1d4ed8")
+    assert rgba[..., 3].min() == 0 and rgba[..., 3].max() == 255
+    assert (rgba[..., :3] == (29, 78, 216)).all(), "every pixel carries the line colour; only the transparency varies"
+
+
+# ----------------------------------------------------------------- 7. One layered PSD
+
+def open_psd(content):
+    import io
+
+    from psd_tools import PSDImage
+    return PSDImage.open(io.BytesIO(content))
+
+
+def test_layers_psd_has_background_colours_and_lines():
+    sid = new_colour_session()
+    r = client.get(f"/api/sessions/{sid}/download", params={"fmt": "layers-psd"})
+    assert r.status_code == 200 and "_layers.psd" in r.headers["content-disposition"], r.text[:200]
+    psd = open_psd(r.content)
+    assert [layer.name for layer in psd] == ["Background", "01 Pink", "02 Orange", "03 Green", "04 Yellow", "Lines"], \
+        [layer.name for layer in psd]
+    assert all(layer.kind == "pixel" for layer in psd)
+    flat = psd.composite()                                       # what Photoshop shows with every layer on
+    u = 1.5                                                      # working pixels per photo pixel for this sample
+    pink = flat.getpixel((int((200 + 52) * u), int(350 * u)))
+    orange = flat.getpixel((int((500 + 52) * u), int(350 * u)))
+    green = flat.getpixel((int(350 * u), int(350 * u)))
+    assert pink[0] > 200 and pink[1] < 150, pink
+    assert orange[0] > 220 and 110 < orange[1] < 200 and orange[2] < 110, orange
+    assert green[1] > green[0] and green[1] > green[2], green
+    assert flat.getpixel((5, 5)) == (255, 255, 255), "paper stays white"
+
+
+def test_perfect_psd_puts_the_ai_lines_over_the_same_colours():
+    import cv2
+
+    shift = (3, 2)                                               # the AI redraws the lines a few pixels off
+
+    def fake_ai(picture, kind="sketch", color="#000000", extra=None):
+        ink = cv2.cvtColor(picture, cv2.COLOR_RGB2GRAY) < 60    # the dark lines of the scan
+        ink = np.roll(ink, shift, axis=(0, 1))
+        rgb = np.full(picture.shape[:2] + (3,), 255, np.uint8)
+        rgb[ink] = (0, 0, 0)
+        return rgb, {"model": "fake", "usage": None}
+
+    real = perfect.make_perfect
+    perfect.make_perfect = fake_ai
+    api._perfect_times.clear()
+    try:
+        sid = new_colour_session()
+        assert client.get(f"/api/sessions/{sid}/download", params={"fmt": "perfect-psd"}).status_code == 404, \
+            "needs a perfect border first"
+        assert client.post(f"/api/sessions/{sid}/perfect").status_code == 200
+        r = client.get(f"/api/sessions/{sid}/download", params={"fmt": "perfect-psd"})
+        assert r.status_code == 200 and "_perfect_layers.psd" in r.headers["content-disposition"], r.text[:200]
+        psd = open_psd(r.content)
+        names = [layer.name for layer in psd]
+        assert names[0] == "Background" and names[-1] == "Perfect border", names
+        assert {"01 Pink", "02 Orange", "03 Green", "04 Yellow"} <= set(names), names
+        flat = psd.composite()
+        u = 1.5
+        pink = flat.getpixel((int((200 + 52) * u), int(350 * u)))
+        orange = flat.getpixel((int((500 + 52) * u), int(350 * u)))
+        green = flat.getpixel((int(350 * u), int(350 * u)))
+        assert pink[0] > 200 and pink[1] < 150, pink
+        assert orange[0] > 220 and 110 < orange[1] < 200 and orange[2] < 110, orange
+        assert green[1] > green[0] and green[1] > green[2], green
+    finally:
+        perfect.make_perfect = real
+        api._perfect_times.clear()
+        api.USAGE_LOG.unlink(missing_ok=True)
+
+
+def test_perfect_psd_without_colours_still_has_the_lines_layer():
+    """A black-and-white sketch has no colour layers: the PSD is the white background + the perfect border."""
+    def fake_ai(picture, kind="sketch", color="#000000", extra=None):
+        return lines_on_white(picture, kind, color, extra)
+
+    real = perfect.make_perfect
+    perfect.make_perfect = fake_ai
+    api._perfect_times.clear()
+    try:
+        sid = new_session()
+        assert client.post(f"/api/sessions/{sid}/perfect").status_code == 200
+        r = client.get(f"/api/sessions/{sid}/download", params={"fmt": "perfect-psd"})
+        assert r.status_code == 200, r.text[:200]
+        assert [layer.name for layer in open_psd(r.content)] == ["Background", "Perfect border"]
+    finally:
+        perfect.make_perfect = real
+        api._perfect_times.clear()
+        api.USAGE_LOG.unlink(missing_ok=True)
+
+
 # ----------------------------------------------------------------- runner
 
 def main():

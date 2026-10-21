@@ -18,7 +18,8 @@ from .clean import clean, scan_line_width
 from .config import Settings
 from .even import even
 from .export import Page, export_bw, export_scan
-from .imageio import hex_rgb, load_gray
+from .imageio import hex_rgb, load_gray, load_rgb
+from . import layers
 from .scan import scan
 
 
@@ -26,7 +27,8 @@ class Session:
     def __init__(self, path, auto_crop=True):
         t = time.time()
         self.path = str(path)
-        self.scan = scan(load_gray(path), auto_crop=auto_crop)
+        self.scan = scan(load_gray(path), auto_crop=auto_crop, rgb=load_rgb(path))
+        self._layer_cache = {}               # colour layers per number of colours (cleared when settings change)
         self.clean = None
         self.even = None
         self.settings = None
@@ -51,6 +53,7 @@ class Session:
 
     def update(self, s: Settings):
         """Re-run checkpoint 2 (and 3 when the output is black & white)."""
+        self._layer_cache = {}
         if s.clean.output == "bw" and s.clean.method == "ai":
             self._ensure_ai()
         t = time.time()
@@ -97,6 +100,19 @@ class Session:
         for y, x in e.loose_ends:
             cv2.circle(img, (x, y), r, (230, 0, 0), t)
         return img
+
+    # ------------------------------------------------------------- colour layers
+
+    def layer_base(self, colors=0):
+        """Colour layers of the black & white result (see layers.py); colors 0 = find the number."""
+        if self.even is None:
+            raise ValueError("Layers need the Black & white lines output.")
+        if self.scan.color is None:
+            raise ValueError("This photo has no colour information.")
+        if colors not in self._layer_cache:
+            self._layer_cache[colors] = layers.build_base(self.scan.color, self.even.mask, self.even.areas,
+                                                          self.even.line_width, colors)
+        return self._layer_cache[colors]
 
     # ------------------------------------------------------------- export
 

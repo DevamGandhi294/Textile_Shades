@@ -17,15 +17,31 @@ import {
   Upload,
   X,
 } from "lucide-react";
+import LayersPanel from "@/components/LayersPanel";
 import SettingsPanel from "@/components/SettingsPanel";
 import { Button, ChoiceCard, Modal, Spinner } from "@/components/controls";
-import { ApiError, createSession, downloadFile, getHealth, makePerfect, sendChat, updateSession, type Result, type Settings } from "@/lib/api";
+import {
+  ApiError,
+  DEFAULT_LAYER_OPTIONS,
+  createSession,
+  downloadFile,
+  getHealth,
+  getLayers,
+  makePerfect,
+  sendChat,
+  updateSession,
+  type LayerOptions,
+  type LayersAnswer,
+  type Result,
+  type Settings,
+} from "@/lib/api";
 import { ALL_FORMATS, DEFAULTS, FORMATS, LIMITS, isDefault, outputTooLarge } from "@/lib/settings";
 
 const VIEWS = [
   { key: "scan", label: "Scanned" },
   { key: "clean", label: "Cleaned" },
   { key: "final", label: "Final result" },
+  { key: "layers", label: "Layers" },
   { key: "perfect", label: "Perfect border" },
   { key: "check", label: "Gap check" },
 ] as const;
@@ -51,7 +67,7 @@ export default function Home() {
   const [settings, setSettings] = useState<Settings>(DEFAULTS);
   const [autoCrop, setAutoCrop] = useState(true);
   const [formats, setFormats] = useState<string[]>(ALL_FORMATS);
-  const [busy, setBusy] = useState<"" | "upload" | "update" | "perfect" | "chat">("");
+  const [busy, setBusy] = useState<"" | "upload" | "update" | "perfect" | "chat" | "layers">("");
   const [seconds, setSeconds] = useState(0);
   const [error, setError] = useState("");
   const [view, setView] = useState<View>("final");
@@ -59,6 +75,8 @@ export default function Home() {
   const [dragging, setDragging] = useState(false);
   const [downloading, setDownloading] = useState(""); // file type being prepared for download
   const [chatOpen, setChatOpen] = useState(false); // "Chat to improve it" panel
+  const [layersData, setLayersData] = useState<LayersAnswer | null>(null); // colour layers (Layers tab)
+  const [layerOpts, setLayerOpts] = useState<LayerOptions>(DEFAULT_LAYER_OPTIONS);
   const [chatLog, setChatLog] = useState<ChatLine[]>([]);
   const [chatInput, setChatInput] = useState("");
   const chatBoxRef = useRef<HTMLDivElement>(null);
@@ -147,6 +165,8 @@ export default function Home() {
     setPhotoUrl(URL.createObjectURL(f));
     setResult(null);
     setPerfectImg(null);
+    setLayersData(null);
+    setLayerOpts(DEFAULT_LAYER_OPTIONS);
     setChatLog([]);
     setChatOpen(false);
     setError("");
@@ -184,6 +204,8 @@ export default function Home() {
     sent.current = JSON.stringify(s);
     try {
       setResult(await createSession(f, s, crop));
+      setLayersData(null);
+      setLayerOpts(DEFAULT_LAYER_OPTIONS);
       setView("final");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -223,7 +245,11 @@ export default function Home() {
     setError("");
     setBusy("update");
     try {
-      setResult(await updateSession(result.id, next));
+      const fresh = await updateSession(result.id, next);
+      setResult(fresh);
+      setLayersData(null);
+      setLayerOpts(DEFAULT_LAYER_OPTIONS);
+      if (view === "layers") await loadLayers(fresh.id, DEFAULT_LAYER_OPTIONS);
     } catch (e) {
       // the server forgot this photo (restart or too long ago): just process it again
       if (e instanceof ApiError && e.status === 404) return upload(file, next, autoCrop);
@@ -245,6 +271,27 @@ export default function Home() {
     setAutoCrop(true);
     edit(DEFAULTS);
     if (result && file) upload(file, DEFAULTS, true);
+  }
+
+  // Colour layers: asked from the server whenever the user opens the tab or changes a choice (free).
+  async function loadLayers(id: string, options: LayerOptions) {
+    setError("");
+    setBusy("layers");
+    try {
+      setLayersData(await getLayers(id, options));
+      setLayerOpts(options);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setView("final");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  // Tab click; the layers are worked out the first time the tab is opened for this result.
+  function openView(v: View) {
+    setView(v);
+    if (v === "layers" && !layersData && result && !busy) loadLayers(result.id, layerOpts);
   }
 
   // OpenAI redraws the final lines with clean, smooth curves; shown as its own view.
@@ -302,6 +349,8 @@ export default function Home() {
     setPhotoUrl(null);
     setResult(null);
     setPerfectImg(null);
+    setLayersData(null);
+    setLayerOpts(DEFAULT_LAYER_OPTIONS);
     setChatLog([]);
     setChatOpen(false);
     setWaiting(false);
@@ -344,14 +393,19 @@ export default function Home() {
   const blocked = !!busy || !!downloading;
 
   const shownViews = VIEWS.filter(
-    (v) => (v.key !== "check" || result?.previews.check) && (v.key !== "perfect" || perfectImg),
+    (v) =>
+      (v.key !== "check" || result?.previews.check) &&
+      (v.key !== "perfect" || perfectImg) &&
+      (v.key !== "layers" || result?.info.output === "bw"),
   );
   const shown =
     view === "perfect" && perfectImg
       ? perfectImg
-      : result
-        ? (result.previews[view as Exclude<View, "perfect">] ?? result.previews.final)
-        : null;
+      : view === "layers" && layersData
+        ? layersData.image
+        : result
+          ? (result.previews[view as Exclude<View, "perfect" | "layers">] ?? result.previews.final)
+          : null;
   const shownLabel = VIEWS.find((v) => v.key === view)?.label ?? "Result";
 
   return (
@@ -506,7 +560,7 @@ export default function Home() {
                       type="button"
                       role="tab"
                       aria-selected={view === v.key}
-                      onClick={() => setView(v.key)}
+                      onClick={() => openView(v.key)}
                       className={`min-h-10 rounded-lg px-3 text-sm font-semibold transition ${
                         view === v.key ? "bg-white text-ink shadow-sm" : "text-muted hover:text-ink"
                       }`}
@@ -540,11 +594,12 @@ export default function Home() {
                       // eslint-disable-next-line @next/next/no-img-element -- previews are data URLs from the API
                       <img src={shown} alt={shownLabel} className="max-h-[70vh] w-full object-contain" />
                     )}
-                    {(busy === "update" || busy === "perfect") && (
+                    {(busy === "update" || busy === "perfect" || busy === "layers") && (
                       <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white/80 px-4 text-center backdrop-blur-[1px]">
                         <Spinner />
                         <p className="font-semibold">
-                          {busy === "perfect" ? "Making the border perfect…" : "Updating…"} {seconds} s
+                          {busy === "perfect" ? "Making the border perfect…" : busy === "layers" ? "Finding the colours…" : "Updating…"}{" "}
+                          {seconds} s
                         </p>
                         {busy === "perfect" && (
                           <p className="text-sm text-muted">Usually under a minute, sometimes up to a few minutes.</p>
@@ -554,6 +609,16 @@ export default function Home() {
                   </div>
                 </figure>
               </div>
+              {view === "layers" && layersData && result && (
+                <LayersPanel
+                  data={layersData}
+                  options={layerOpts}
+                  busy={!!busy}
+                  downloading={downloading}
+                  onChange={(next) => loadLayers(result.id, next)}
+                  onDownload={(fmt) => save(fmt, fmt === "layers-svg" ? "svg" : fmt === "layers-psd" ? "psd" : "zip")}
+                />
+              )}
               <Summary result={result} />
               {perfectReady && (
                 <div className="flex flex-col gap-3 rounded-2xl border border-brand/40 bg-mint-soft p-4">
@@ -698,11 +763,31 @@ export default function Home() {
                 >
                   <span className="flex flex-col">
                     <span className="font-semibold">
-                      {downloading === "perfect" ? "Preparing…" : "Perfect border (PNG)"}
+                      {downloading === "perfect" ? "Preparing…" : "Perfect border (transparent PNG)"}
                     </span>
                     <span className="text-sm text-muted">
-                      The AI-smoothed version, as a picture only: it is not in the SVG, PDF, EPS or DXF files. Also
+                      Black lines on a transparent background, with no colour: open it in Photoshop as one layer and
+                      add colour layers under it. A picture only, so it is not in the SVG, PDF, EPS or DXF files. Also
                       included in the ZIP.
+                    </span>
+                  </span>
+                </button>
+              )}
+              {perfectImg && (
+                <button
+                  type="button"
+                  onClick={() => save("perfect-psd", "psd")}
+                  disabled={blocked}
+                  className="flex items-center gap-3 rounded-xl border border-brand bg-mint-soft px-4 py-3 text-left transition hover:bg-mint/40 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <span className="flex flex-col">
+                    <span className="font-semibold">
+                      {downloading === "perfect-psd" ? "Preparing…" : "Perfect border with layers (PSD)"}
+                    </span>
+                    <span className="text-sm text-muted">
+                      One Photoshop file with separate layers: a white background, a layer for each colour of your photo,
+                      and your perfect border on top. If the photo has no colour, it has the background and the border.
+                      No extra cost.
                     </span>
                   </span>
                 </button>

@@ -19,6 +19,16 @@ def load_gray(path):
     return np.asarray(img.convert("L"), dtype=np.uint8).copy()
 
 
+def load_rgb(path):
+    """The same photo as load_gray, but in colour (8-bit RGB, turned upright)."""
+    img = Image.open(path)
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, img.convert("RGBA"))
+    return np.asarray(img.convert("RGB"), dtype=np.uint8).copy()
+
+
 def save_gray(img, path, dpi):
     """8-bit grayscale PNG or TIFF with the given DPI."""
     path = Path(path)

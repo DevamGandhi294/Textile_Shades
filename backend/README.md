@@ -92,6 +92,43 @@ under 1 s on a GPU). After that, every setting change reuses it and takes a few 
 | Smooth and straighten | 0 follows the pencil · 1 balanced · 2 very smooth |
 | Join small breaks | Bridges a gap where two line ends face each other, as thick as that line |
 
+## Colour layers (free, offline)
+
+For a coloured sketch the website's **Layers** tab splits the design into one layer per colour, the way a
+designer works in Photoshop or textile CAD: every area of the same colour is one layer, so one change
+recolours all of them. No AI and no cost (`sketchclean/layers.py`):
+
+1. **Colour scan** (`scan.color_scan`): the photo keeps its colour. The paper's light is measured on paper
+   pixels only (so coloured areas never count as shadow), per colour channel; dividing by it evens out the
+   light and removes the lamp's colour cast.
+2. **Palette:** the colours of the design (k-means in Lab); colours that look alike are merged and crumbs are
+   dropped. The user can also choose the number of colours (2 to 12), merge two colours, or hide a layer.
+3. **Layers:** every closed box (from the final lines) takes the colour most of its pixels have, so shapes are
+   crisp and follow the lines; colour is extended under the lines so no gap shows if the lines are hidden.
+   Greys and white are not colours: white areas belong to no layer.
+4. **Downloads:** `layers-psd` = ONE Photoshop file: a white "Background", a layer per colour ("01 Pink", ...)
+   and the lines on top (soft edges kept, DPI stored); `layers-svg` = one SVG with a group per colour
+   (Inkscape layers, top-level groups for Illustrator and CorelDRAW) and a "Lines" group on top;
+   `layers-zip` = one transparent PNG per colour, one for the lines and a composite, all the same size.
+
+A photo only gets colour layers if it really has colour: tinted paper, shadows and pencil sketches give no
+layers (colours need a Lab chroma of about 20+, and some strong colour must be present). Very pale
+pastels on their own are not detected. A small colour that is clearly different from the others (a flower
+centre) is kept; the muddy blend on the edge between two colours is not.
+
+The layers need the Black & white output. They are not in the normal ZIP.
+Try it with `samples/07_color_border.jpg` (made by `tools/make_colour_sample.py`).
+
+**The AI's perfect border as a layered PSD (`perfect-psd`, no extra AI call):** after "Make border perfect"
+the website offers one PSD with the AI's lines on top ("Perfect border") over the colour layers of the photo.
+The AI redraws the lines a few pixels off the photo, so each closed box of the AI lines takes the colour
+layer most of its area has in the photo (`layers.refit_to_lines`, a vote over the whole box), and the colour
+is extended under the lines. If the photo has no colour, the PSD is the white background and the
+"Perfect border" layer. It uses the number of colours and merges last chosen in the Layers tab.
+
+**Not verified yet:** how the layers show in the real software (Illustrator, CorelDRAW, Photoshop, Wilcom).
+Test the SVG and the PNG layers there before relying on them.
+
 ## Make border perfect (optional, paid)
 
 The website's **Make border perfect** button sends the picture to an OpenAI image model, which
@@ -130,8 +167,9 @@ Every successful call adds one line to `outputs/openai_usage.jsonl` (time, sessi
 quality, size, source and OpenAI's token usage) for cost tracking. Calls are never retried
 automatically, because every call is paid.
 
-The AI result is a **PNG only**: it is not vectorised, so it is not in the SVG / PDF / EPS / DXF
-files. It is included in the ZIP download.
+The AI result is a PNG (or the layered PSD above): it is not vectorised, so it is not in the SVG / PDF / EPS / DXF
+files. The download is black lines (in the chosen line colour) on a **transparent** background, so it opens
+in Photoshop as one layer for the colour layers to go under. It is included in the ZIP download.
 
 ## Outputs
 
@@ -164,11 +202,13 @@ sketchclean/
   lines.py                centre lines, width, loose ends, gap bridges, centre-line paths
   vectorize.py            B&W → smooth vector shapes, and back to pixels
   export.py               SVG / PDF / EPS / DXF / PNG / TIFF / BMP writers
+  layers.py               colour layers: palette, layer per colour, layered SVG and PNG ZIP
   pipeline.py             Session: runs the checkpoints, caches the scan and the AI result
 tools/
   export_onnx.py          make the full-precision ONNX model from the original weights
   compare_binarization.py research: 9 binarization algorithms side by side (needs doxapy)
   make_samples.py         generates the synthetic test sketches
+  make_colour_sample.py   a synthetic hand-coloured border (samples/07_color_border.jpg)
 tests/smoke_test.py       every sample × 6 settings, all formats
 tests/api_test.py         web API: setting limits, errors, Make border perfect (no network)
 samples/                  test images

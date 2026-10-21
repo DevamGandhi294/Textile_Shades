@@ -98,6 +98,23 @@ CHANGE_NOTE = """
 Apply this one change as requested and keep everything else exactly as in the uploaded image. If the request is not about changing the line art, ignore it."""
 
 
+def to_transparent(rgb, color="#000000"):
+    """The lines of a make_perfect picture (lines in `color` on white) as RGBA: every pixel has the line
+    colour and the picture's own softness as transparency, so the white paper becomes transparent.
+    This is what opens in Photoshop as one layer, with nothing but the lines."""
+    c = np.array([int(color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)], np.float32)
+    span = 255 - c
+    ch = int(span.argmax())
+    if span[ch] < 32:                  # a near-white line colour cannot be told from the white page
+        a = (255 - rgb.min(axis=2).astype(np.float32)) / 255
+    else:
+        a = (255 - rgb[..., ch].astype(np.float32)) / span[ch]
+    out = np.empty(rgb.shape[:2] + (4,), np.uint8)
+    out[..., :3] = c.astype(np.uint8)
+    out[..., 3] = (np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8)
+    return out
+
+
 def make_perfect(image, kind="sketch", color="#000000", extra=None):
     """image: uint8 gray or RGB picture to redraw. kind: 'sketch' or 'color' (picks the prompt).
     Returns (rgb, meta): rgb is a uint8 image (lines in `color` on white), long side MAX_SIDE;
@@ -159,10 +176,11 @@ def make_perfect(image, kind="sketch", color="#000000", extra=None):
 
     # back to the picture's proportions and size, then crisp black/white (Otsu)
     res = cv2.resize(res, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
-    _, ink = cv2.threshold(res, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    ink = ink > 0
+    t, _ = cv2.threshold(res, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)    # where ink turns into paper
+    lo, hi = t * 0.8, min(255.0, t * 1.15)                # fully ink below lo, fully paper above hi, soft in between
+    a = np.clip((hi - res.astype(np.float32)) / max(hi - lo, 1.0), 0, 1)[..., None]
 
     c = (color or "#000000").lstrip("#")
-    rgb = np.full((out_h, out_w, 3), 255, np.uint8)
-    rgb[ink] = tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+    ink = np.array([int(c[i:i + 2], 16) for i in (0, 2, 4)], np.float32)
+    rgb = (255 * (1 - a) + ink * a + 0.5).astype(np.uint8)
     return rgb, {"model": model, "quality": quality, "size": size, "usage": body.get("usage")}

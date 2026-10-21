@@ -68,6 +68,9 @@ const FIELD_NAMES: Record<string, string> = {
   color: "Line colour",
   dpi: "DPI",
   width_cm: "Width in cm",
+  colors: "Number of colours",
+  merge: "Merged colours",
+  hidden: "Hidden layers",
 };
 
 type ValidationItem = { loc?: (string | number)[]; msg?: string };
@@ -152,6 +155,25 @@ export function sendChat(id: string, message: string) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message }),
+  });
+}
+
+// Colour layers: one layer per colour of the photo (free, made on the server without AI).
+export type Layer = { id: number; hex: string; name: string; share: number };
+export type LayersAnswer = { image: string; palette: Layer[] };
+export type LayerOptions = {
+  colors: number; // 0 = find the number automatically
+  merge: [number, number][]; // [from layer id, to layer id]
+  hidden: number[]; // layers left out of the preview
+  show_lines: boolean;
+};
+export const DEFAULT_LAYER_OPTIONS: LayerOptions = { colors: 0, merge: [], hidden: [], show_lines: true };
+
+export function getLayers(id: string, options: LayerOptions) {
+  return call<LayersAnswer>(`${API_URL}/api/sessions/${id}/layers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(options),
   });
 }
 

@@ -11,7 +11,8 @@ uploaded image; the Session is kept in memory so a settings change only re-runs 
     POST /api/sessions/{id}/update      new settings    -> previews
     POST /api/sessions/{id}/perfect     ?source=sketch|color  -> AI redraw (paid, limited; see README)
     POST /api/sessions/{id}/chat        {message}  -> ask for a change in words (image edits only)
-    GET  /api/sessions/{id}/download    ?fmt=zip|png|pdf|svg|eps|dxf|tiff|bmp|perfect
+    POST /api/sessions/{id}/layers      {colors, merge, hidden} -> colour layers (free, offline)
+    GET  /api/sessions/{id}/download    ?fmt=zip|png|pdf|svg|eps|dxf|tiff|bmp|perfect|layers-svg|layers-zip|layers-psd|perfect-psd
     GET  /api/health
 """
 import argparse
@@ -31,7 +32,7 @@ from collections import OrderedDict, deque
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 import cv2
 import numpy as np
@@ -42,7 +43,10 @@ from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 
 from sketchclean import CleanSettings, EvenSettings, OutputSettings, Session, Settings
-from sketchclean import ai
+from sketchclean import ai, layers
+from sketchclean.export import Page
+from sketchclean.imageio import hex_rgb, load_rgb
+from sketchclean.lines import line_width
 import chat
 import perfect
 
@@ -116,6 +120,7 @@ class Entry:
         self.perfect = None                  # PNG from "Make border perfect"
         self.perfect_calls = 0               # paid image calls used (or running) for this photo
         self.chat_calls = 0                  # chat messages used for this photo
+        self.layer_state = {"colors": 0, "merge": []}   # what the user last chose in the Layers tab (used by the downloads)
         self.chat_history = []               # last on-topic turns, so "make it thinner" follows the last change
 
 
@@ -316,6 +321,7 @@ def update_session(sid: str, settings: SettingsIn):
     s = settings.to_settings()
     with entry.lock:
         entry.sess.update(s)
+        entry.layer_state = {"colors": 0, "merge": []}      # the layers belong to the old lines
         return _result(sid, entry)
 
 
@@ -331,7 +337,7 @@ def _paid_redraw(sid, entry, source, extra=None, refine=False):
                                      "Upload the photo again to try more.")
         s = entry.sess
         if refine and entry.perfect is not None and entry.perfect.exists():
-            picture = np.asarray(Image.open(entry.perfect).convert("RGB")).copy()
+            picture = load_rgb(entry.perfect)             # transparent lines are put on white paper again
         else:
             picture = s.preview_scan().copy()     # the scanned image (checkpoint 1)
             if not refine:
@@ -358,7 +364,8 @@ def _paid_redraw(sid, entry, source, extra=None, refine=False):
         if not entry.folder.exists():          # the photo expired while the call was running
             raise HTTPException(404, "This picture has expired. Please upload it again.")
         path = entry.folder / f"{entry.stem}_perfect.png"
-        Image.fromarray(rgb, "RGB").save(path, dpi=(dpi, dpi))
+        # the file is black lines on a transparent background (one layer in Photoshop); the preview stays on white
+        Image.fromarray(perfect.to_transparent(rgb, color), "RGBA").save(path, dpi=(dpi, dpi))
         entry.perfect = path
         usage = _perfect_usage(entry)
     return rgb, usage
@@ -434,6 +441,98 @@ def chat_edit(sid: str, body: ChatIn, authorization: Optional[str] = Header(None
     return {"reply": reply, "image": image, "perfect": usage, "chat": chat_usage}
 
 
+LayerId = Annotated[int, Field(ge=0, le=layers.MAX_COLORS - 1)]
+
+
+class LayersIn(BaseModel):
+    colors: int = Field(0, ge=0, le=layers.MAX_COLORS)                       # 0 = find the number automatically
+    merge: list[tuple[LayerId, LayerId]] = Field(default_factory=list, max_length=layers.MAX_COLORS)   # (from, to)
+    hidden: list[LayerId] = Field(default_factory=list, max_length=layers.MAX_COLORS)
+    show_lines: bool = True
+
+
+@app.post("/api/sessions/{sid}/layers")
+def colour_layers(sid: str, body: LayersIn):
+    """Colour layers of the black & white result: the colours found in the photo, and a preview with the
+    chosen layers hidden. Free and offline (no AI). The choices are remembered for the layer downloads."""
+    entry = _get(sid)
+    with entry.lock:
+        sess = entry.sess
+        try:
+            base = sess.layer_base(body.colors)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        labels, palette = layers.apply_merge(base, body.merge)
+        entry.layer_state = {"colors": body.colors, "merge": list(body.merge)}
+        img = layers.composite(labels, palette, set(body.hidden), base.lines,
+                               hex_rgb(sess.settings.output.color), body.show_lines)
+    return {"image": _data_url(img),
+            "palette": [{k: e[k] for k in ("id", "hex", "name", "share")} for e in palette]}
+
+
+def _download_layers(entry, fmt):
+    """layers-svg: one SVG, a group per colour + the lines. layers-zip: a transparent PNG per colour.
+    layers-psd: one PSD with a layer per colour and the lines on top."""
+    with entry.lock:
+        sess = entry.sess
+        try:
+            base = sess.layer_base(entry.layer_state["colors"])
+            work_h, work_w = sess.clean.image.shape
+            page = Page(work_w, work_h, sess.settings.output.dpi, sess.settings.output.width_cm)
+        except ValueError as e:
+            raise HTTPException(422 if "too large" in str(e) else 400, str(e))
+        labels, palette = layers.apply_merge(base, entry.layer_state["merge"])
+        if not palette:
+            raise HTTPException(400, "No colours were found in this photo, so there are no colour layers.")
+        out = entry.folder / "layers"
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir(parents=True)
+        line_hex = sess.settings.output.color
+        if fmt == "layers-svg":
+            path = out / f"{entry.stem}_layers.svg"
+            layers.write_layers_svg(path, labels, palette, sess.even.shapes, page, line_hex)
+            return FileResponse(path, filename=path.name, media_type="image/svg+xml")
+        if fmt == "layers-psd":
+            path = out / f"{entry.stem}_layers.psd"
+            layers.write_layers_psd(path, labels, palette, base.lines.astype(np.uint8) * 255, hex_rgb(line_hex),
+                                    sess.settings.output.dpi / page.scale)
+            return FileResponse(path, filename=path.name, media_type="image/vnd.adobe.photoshop")
+        path = out / f"{entry.stem}_layers.zip"
+        # the PNGs have the working size, so their DPI is scaled to give the chosen physical size
+        layers.write_layers_zip(path, labels, palette, base.lines, hex_rgb(line_hex), sess.settings.output.dpi / page.scale)
+        return FileResponse(path, filename=path.name, media_type="application/zip")
+
+
+def _download_perfect_psd(entry):
+    """perfect-psd: ONE layered PSD with the AI's perfect border on top of the colour layers of the photo.
+    The colours come from the photo (offline); the AI lines only decide the shapes. No extra AI call."""
+    with entry.lock:
+        if entry.perfect is None or not entry.perfect.exists():
+            raise HTTPException(404, "Press Make border perfect first.")
+        sess = entry.sess
+        try:
+            base = sess.layer_base(entry.layer_state["colors"])
+            work_h, work_w = sess.clean.image.shape
+            page = Page(work_w, work_h, sess.settings.output.dpi, sess.settings.output.width_cm)
+        except ValueError as e:
+            raise HTTPException(422 if "too large" in str(e) else 400, str(e))
+        with Image.open(entry.perfect) as im:
+            alpha = np.asarray(im.convert("RGBA"))[..., 3]
+        if alpha.shape != (work_h, work_w):
+            alpha = cv2.resize(alpha, (work_w, work_h), interpolation=cv2.INTER_CUBIC)
+        labels, palette = layers.apply_merge(base, entry.layer_state["merge"])
+        ink = alpha > 127
+        fitted = layers.refit_to_lines(labels, ink, line_width(ink))
+        palette = [e for e in palette if (fitted == e["id"]).any()]      # colours the AI lines still have
+        out = entry.folder / "layers"
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir(parents=True)
+        path = out / f"{entry.stem}_perfect_layers.psd"
+        layers.write_layers_psd(path, fitted, palette, alpha, hex_rgb(sess.settings.output.color),
+                                sess.settings.output.dpi / page.scale, lines_name="Perfect border")
+        return FileResponse(path, filename=path.name, media_type="image/vnd.adobe.photoshop")
+
+
 @app.get("/api/sessions/{sid}/download")
 def download(sid: str, fmt: str = "zip"):
     """One file (png, pdf, svg, eps, dxf, tiff, bmp) or everything in one zip."""
@@ -443,6 +542,10 @@ def download(sid: str, fmt: str = "zip"):
         if entry.perfect is None or not entry.perfect.exists():
             raise HTTPException(404, "Press Make border perfect first.")
         return FileResponse(entry.perfect, filename=entry.perfect.name)
+    if fmt == "perfect-psd":
+        return _download_perfect_psd(entry)
+    if fmt in ("layers-svg", "layers-zip", "layers-psd"):
+        return _download_layers(entry, fmt)
     if fmt not in ("zip",) + ALL_FORMATS:
         raise HTTPException(422, f"Unknown format: {fmt}")
     with entry.lock:
