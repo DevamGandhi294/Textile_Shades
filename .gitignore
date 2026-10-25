@@ -1,0 +1,24 @@
+# secrets: never commit (copy the .env.example files instead)
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Node / Next.js (also in frontend/.gitignore)
+node_modules/
+.next/
+
+# images saved by magic_db (STORAGE_BACKEND=local), and tool output
+storage_data/
+outputs/
+
+# editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
