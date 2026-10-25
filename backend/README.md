@@ -129,6 +129,33 @@ is extended under the lines. If the photo has no colour, the PSD is the white ba
 **Not verified yet:** how the layers show in the real software (Illustrator, CorelDRAW, Photoshop, Wilcom).
 Test the SVG and the PNG layers there before relying on them.
 
+## AI layers (optional, paid: one image call per layer)
+
+The **AI layers** tab turns the uploaded photo into one layered PSD where the AI does all the work
+(`layer_pipeline.py`; nothing local looks at the picture). The user first chooses the machine or design type:
+**Embroidery**, **Digital Print** or **CAD**; it is part of every prompt.
+
+1. **Check my design** (`POST /ai-analyse`, one cheap call to a small vision model, `OPENAI_ANALYSIS_MODEL`,
+   default `gpt-4.1-mini`). It answers in JSON: `image_type` (line / color), `is_complete`, `is_symmetric`,
+   `mirror` and the `layers` (name + description) to make. The layers depend on the machine: Embroidery splits by
+   thread colour and stitch type, Print by colour (ink), CAD one layer per motif. For a symmetric design only the
+   left half is described and drawn. The user sees the plan and **how many image calls it needs before anything
+   is paid**.
+2. **Model routing** (`pick_model`): a complete design uses `MODEL_COMPLETE` (default `gpt-image-2.5-flare`),
+   an incomplete one `MODEL_INCOMPLETE` (default `gpt-image-1-mini`). Change them in `.env`.
+3. **One image call per layer** (`POST /ai-layers`, a few at a time): that layer only, as clean, fully closed borders
+   on a transparent background; a colour design gets area-wise border colours, a line design one dark colour
+   (`#1a1a1a`). Models that cannot draw on transparency (anything but `gpt-image-1*`) are asked for pure white,
+   which Python turns into transparency.
+4. **Export** (`ai-layers-psd`): one PSD with psd-tools, a white Background, the original photo as a hidden layer and
+   one named layer for each AI layer, bottom to top. A mirrored design is flipped horizontally to make the other half.
+
+Limits: at most `AI_LAYERS_MAX_LAYERS` layers (6) per design, `AI_LAYERS_MAX_RUNS_PER_SESSION` (2) runs per photo, every
+image call counts in `PERFECT_MAX_PER_HOUR`, and the design check counts as a chat message. If one layer fails, the others
+are kept and the unpaid slots are given back. Every call is logged in `outputs/openai_usage.jsonl`
+(`source: ai-analyse` and `ai-layer`, with the prompt). **Each layer is a separate AI redraw, so the layers can differ by a
+few pixels from each other.** A real vector-shape PSD cannot be written by the library: the PSD has pixel layers.
+
 ## Make border perfect (optional, paid)
 
 The website's **Make border perfect** button sends the picture to an OpenAI image model, which
@@ -144,7 +171,7 @@ Settings go in `backend/.env` (copy `.env.example`; never commit `.env`):
 | `OPENAI_IMAGE_MODEL` | `gpt-image-2` | image model |
 | `OPENAI_IMAGE_QUALITY` | `medium` | `low` for cheap previews; `high` costs about 4× medium |
 | `OPENAI_INPUT_FIDELITY` | `low` | gpt-image-1 models only |
-| `OPENAI_CHAT_MODEL` | `gpt-4.1-nano` | text model that checks chat messages |
+| `OPENAI_CHAT_MODEL` | `gpt-4.1-mini` | text model that checks chat messages |
 | `CHAT_MAX_MESSAGES_PER_SESSION` | 20 | chat messages per uploaded photo (then HTTP 429) |
 | `CHAT_MAX_PER_HOUR` | 300 | chat messages for the whole server in a rolling hour (then HTTP 429) |
 | `API_TOKEN` | not set | if set, the call needs `Authorization: Bearer <token>` (a warning is logged when unset) |
@@ -155,7 +182,7 @@ Settings go in `backend/.env` (copy `.env.example`; never commit `.env`):
 ### Chat to improve it
 
 Instead of the one-click button, the user can open a chat and ask for a change in words ("make the lines
-thinner", "close the small gaps"). A very cheap text model (`chat.py`, `gpt-4.1-nano` by default) first
+thinner", "close the small gaps"). A very cheap text model (`chat.py`, `gpt-4.1-mini` by default) first
 checks the message: only requests to improve or edit the border image are allowed. Anything else (general
 questions, other topics, questions about the model or its prompts) gets a fixed refusal from the server
 and no image is made. An allowed edit is sent to the image model together with the default prompt; it

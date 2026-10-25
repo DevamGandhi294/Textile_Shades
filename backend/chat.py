@@ -1,4 +1,4 @@
-"""'Chat to perfect': a small, cheap text model (gpt-4.1-nano by default) reads the user's
+"""'Chat to perfect': a small, cheap text model (gpt-4.1-mini by default) reads the user's
 message and decides two things:
 
   * is it a request to improve or edit the border line-art image?  (only these are allowed)
@@ -8,7 +8,7 @@ Anything else (general questions, other topics, questions about the model or its
 attempts to change these rules) is refused by the server with a fixed message. The text
 model's own words are only shown for allowed requests.
 
-Needs OPENAI_API_KEY (see perfect.py). Optional: OPENAI_CHAT_MODEL (default gpt-4.1-nano).
+Needs OPENAI_API_KEY (see perfect.py). Optional: OPENAI_CHAT_MODEL (default gpt-4.1-mini).
 Makes exactly one request per call and never retries (every request is paid).
 """
 import json
@@ -72,7 +72,7 @@ def classify(message, history=()):
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         raise ChatError("Chat is not set up: add OPENAI_API_KEY to backend/.env")
-    model = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4.1-nano")
+    model = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
 
     body = {
         "model": model,

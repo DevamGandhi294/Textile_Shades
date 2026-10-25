@@ -68,6 +68,12 @@ class Session:
         self.settings = s
         return self
 
+    def ensure_lines(self):
+        """Run checkpoints 2 and 3 now if they were skipped so far (settings set, nothing cleaned yet)."""
+        if self.clean is None and self.settings is not None:
+            self.update(self.settings)
+        return self
+
     # ------------------------------------------------------------- previews (RGB uint8)
 
     def preview_scan(self):

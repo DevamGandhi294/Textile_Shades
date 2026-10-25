@@ -17,6 +17,7 @@ import {
   Upload,
   X,
 } from "lucide-react";
+import AiLayersPanel from "@/components/AiLayersPanel";
 import LayersPanel from "@/components/LayersPanel";
 import SettingsPanel from "@/components/SettingsPanel";
 import { Button, ChoiceCard, Modal, Spinner } from "@/components/controls";
@@ -26,12 +27,17 @@ import {
   createSession,
   downloadFile,
   getHealth,
+  analyseDesign,
+  getAiLayers,
   getLayers,
+  makeAiLayers,
   makePerfect,
   sendChat,
   updateSession,
+  type AiLayersState,
   type LayerOptions,
   type LayersAnswer,
+  type Machine,
   type Result,
   type Settings,
 } from "@/lib/api";
@@ -42,10 +48,17 @@ const VIEWS = [
   { key: "clean", label: "Cleaned" },
   { key: "final", label: "Final result" },
   { key: "layers", label: "Layers" },
+  { key: "ailayers", label: "AI layers" },
   { key: "perfect", label: "Perfect border" },
   { key: "check", label: "Gap check" },
 ] as const;
 type View = (typeof VIEWS)[number]["key"];
+
+// The free results of the local model (Scanned, Cleaned, Final result, Layers, Gap check, their chips and downloads)
+// are hidden: users only see the AI results. The code still runs (the AI uses the scanned photo). Set to true to show them again.
+const SHOW_LOCAL = false;
+const LOCAL_VIEWS: View[] = ["scan", "clean", "final", "layers", "check"];
+const FIRST_VIEW: View = SHOW_LOCAL ? "final" : "ailayers";
 
 const WIDE = 1024; // from this width the settings panel sits next to the page instead of covering it
 const isWide = () => typeof window !== "undefined" && window.innerWidth >= WIDE;
@@ -67,16 +80,21 @@ export default function Home() {
   const [settings, setSettings] = useState<Settings>(DEFAULTS);
   const [autoCrop, setAutoCrop] = useState(true);
   const [formats, setFormats] = useState<string[]>(ALL_FORMATS);
-  const [busy, setBusy] = useState<"" | "upload" | "update" | "perfect" | "chat" | "layers">("");
+  const [busy, setBusy] = useState<"" | "upload" | "update" | "perfect" | "chat" | "layers" | "aiAnalyse" | "aiLayers">(
+    "",
+  );
   const [seconds, setSeconds] = useState(0);
   const [error, setError] = useState("");
-  const [view, setView] = useState<View>("final");
+  const [view, setView] = useState<View>(FIRST_VIEW);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [downloading, setDownloading] = useState(""); // file type being prepared for download
   const [chatOpen, setChatOpen] = useState(false); // "Chat to improve it" panel
   const [layersData, setLayersData] = useState<LayersAnswer | null>(null); // colour layers (Layers tab)
   const [layerOpts, setLayerOpts] = useState<LayerOptions>(DEFAULT_LAYER_OPTIONS);
+  const [machine, setMachine] = useState<Machine>("embroidery"); // what the layers are for (embroidery, print, CAD)
+  const [aiState, setAiState] = useState<AiLayersState | null>(null); // AI layers: the plan and the layers made
+  const [aiHidden, setAiHidden] = useState<number[]>([]);
   const [chatLog, setChatLog] = useState<ChatLine[]>([]);
   const [chatInput, setChatInput] = useState("");
   const chatBoxRef = useRef<HTMLDivElement>(null);
@@ -167,6 +185,8 @@ export default function Home() {
     setPerfectImg(null);
     setLayersData(null);
     setLayerOpts(DEFAULT_LAYER_OPTIONS);
+    setAiState(null);
+    setAiHidden([]);
     setChatLog([]);
     setChatOpen(false);
     setError("");
@@ -206,7 +226,9 @@ export default function Home() {
       setResult(await createSession(f, s, crop));
       setLayersData(null);
       setLayerOpts(DEFAULT_LAYER_OPTIONS);
-      setView("final");
+      setAiState(null);
+      setAiHidden([]);
+      setView(FIRST_VIEW);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setWaiting(true);
@@ -288,6 +310,51 @@ export default function Home() {
     }
   }
 
+  // AI layers, step 1 (cheap): the AI checks the design and says which layers it will make.
+  async function analyse() {
+    if (!result || busy) return;
+    setError("");
+    setBusy("aiAnalyse");
+    try {
+      setAiState(await analyseDesign(result.id, machine));
+      setAiHidden([]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  // AI layers, steps 2 to 4 (paid): one AI picture for every layer. If some fail, the others are kept and shown.
+  async function makeAi() {
+    if (!result || busy) return;
+    setError("");
+    setBusy("aiLayers");
+    try {
+      setAiState(await makeAiLayers(result.id));
+      setAiHidden([]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      try {
+        setAiState(await getAiLayers(result.id, []));
+        setAiHidden([]);
+      } catch {}
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function toggleAiLayer(id: number) {
+    if (!result || busy) return;
+    const next = aiHidden.includes(id) ? aiHidden.filter((x) => x !== id) : [...aiHidden, id];
+    setAiHidden(next);
+    try {
+      setAiState(await getAiLayers(result.id, next));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   // Tab click; the layers are worked out the first time the tab is opened for this result.
   function openView(v: View) {
     setView(v);
@@ -335,7 +402,11 @@ export default function Home() {
       const reason = e instanceof Error ? e.message : String(e);
       // a limit was reached: show that counter as full so the box says so
       if (e instanceof ApiError && e.status === 429) {
-        const which = reason.includes("chat messages") ? "chat" : reason.includes("Make border perfect") ? "perfect" : null;
+        const which = reason.includes("chat messages")
+          ? "chat"
+          : reason.includes("Make border perfect")
+            ? "perfect"
+            : null;
         if (which) setResult((r) => (r?.[which] ? { ...r, [which]: { ...r[which], used: r[which].limit } } : r));
       }
       setChatLog((l) => [...l, { role: "assistant", text: reason, error: true }]);
@@ -351,6 +422,8 @@ export default function Home() {
     setPerfectImg(null);
     setLayersData(null);
     setLayerOpts(DEFAULT_LAYER_OPTIONS);
+    setAiState(null);
+    setAiHidden([]);
     setChatLog([]);
     setChatOpen(false);
     setWaiting(false);
@@ -396,16 +469,20 @@ export default function Home() {
     (v) =>
       (v.key !== "check" || result?.previews.check) &&
       (v.key !== "perfect" || perfectImg) &&
-      (v.key !== "layers" || result?.info.output === "bw"),
+      (v.key !== "layers" || result?.info.output === "bw") &&
+      (v.key !== "ailayers" || perfectReady) &&
+      (SHOW_LOCAL || !LOCAL_VIEWS.includes(v.key)),
   );
   const shown =
     view === "perfect" && perfectImg
       ? perfectImg
       : view === "layers" && layersData
         ? layersData.image
-        : result
-          ? (result.previews[view as Exclude<View, "perfect" | "layers">] ?? result.previews.final)
-          : null;
+        : view === "ailayers" && aiState?.image
+          ? aiState.image
+          : result && SHOW_LOCAL
+            ? (result.previews[view as Exclude<View, "perfect" | "layers" | "ailayers">] ?? result.previews.final)
+            : null;
   const shownLabel = VIEWS.find((v) => v.key === view)?.label ?? "Result";
 
   return (
@@ -419,7 +496,8 @@ export default function Home() {
               TextileBorder <span className="text-brand">OutlineTool</span>
             </h1>
             <p className="hidden text-sm text-muted md:block">
-              Upload a photo or scan of a sketch. It becomes a clean scan automatically; adjust only if needed, then download.
+              Upload a photo or scan of a sketch. It becomes a clean scan automatically; adjust only if needed, then
+              download.
             </p>
           </div>
           <Button kind="ghost" onClick={() => setWelcome(true)} className="px-3">
@@ -441,10 +519,18 @@ export default function Home() {
       <div className="mx-auto flex w-full max-w-[90rem] items-start gap-6 px-4 py-4 sm:px-8 sm:py-5">
         <main className="flex min-w-0 flex-1 flex-col gap-6">
           {error && (
-            <div role="alert" className="flex items-start gap-3 rounded-2xl border border-red-200 bg-red-50 px-5 py-4 text-red-900">
+            <div
+              role="alert"
+              className="flex items-start gap-3 rounded-2xl border border-red-200 bg-red-50 px-5 py-4 text-red-900"
+            >
               <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0" aria-hidden />
               <span className="flex-1">{error}</span>
-              <button type="button" onClick={() => setError("")} aria-label="Close message" className="rounded-full p-1 hover:bg-red-100">
+              <button
+                type="button"
+                onClick={() => setError("")}
+                aria-label="Close message"
+                className="rounded-full p-1 hover:bg-red-100"
+              >
                 <X className="h-4 w-4" aria-hidden />
               </button>
             </div>
@@ -459,7 +545,8 @@ export default function Home() {
                 </span>
                 <h2 className="text-2xl font-semibold tracking-tight sm:text-3xl">Bring your sketch to life.</h2>
                 <p className="max-w-2xl text-muted">
-                  Add a photo of your border drawing. We&apos;ll help turn it into clean lines you can use for embroidery, printing or design.
+                  Add a photo of your border drawing. We&apos;ll help turn it into clean lines you can use for
+                  embroidery, printing or design.
                 </p>
               </div>
 
@@ -506,7 +593,8 @@ export default function Home() {
               <p className="flex items-start gap-3 rounded-2xl bg-sand px-4 py-3 text-sm">
                 <Info className="mt-0.5 h-5 w-5 shrink-0 text-btn" aria-hidden />
                 <span>
-                  <b className="font-semibold">A little photo tip:</b> Good light and a straight-above photo help us find the lines in your drawing.
+                  <b className="font-semibold">A little photo tip:</b> Good light and a straight-above photo help us
+                  find the lines in your drawing.
                 </span>
               </p>
             </Card>
@@ -518,7 +606,11 @@ export default function Home() {
               <CardTitle step="Step 2" title="Your photo is ready" />
               {photoUrl && (
                 // eslint-disable-next-line @next/next/no-img-element -- local photo preview
-                <img src={photoUrl} alt="Your photo" className="max-h-96 w-full rounded-2xl bg-gray-50 object-contain" />
+                <img
+                  src={photoUrl}
+                  alt="Your photo"
+                  className="max-h-96 w-full rounded-2xl bg-gray-50 object-contain"
+                />
               )}
               <p className="text-muted">Check the settings, then press Start cleaning.</p>
               <div className="flex flex-wrap gap-3">
@@ -539,9 +631,9 @@ export default function Home() {
             <Card>
               <div className="flex flex-col items-center gap-3 py-16 text-center">
                 <Spinner />
-                <p className="text-xl font-semibold">Cleaning your sketch… {seconds} s</p>
+                <p className="text-xl font-semibold">{SHOW_LOCAL ? "Cleaning your sketch…" : "Preparing your photo…"} {seconds} s</p>
                 <p className="text-muted">
-                  This usually takes 20 to 40 seconds. Please keep this page open.
+                  {SHOW_LOCAL ? "This usually takes 20 to 40 seconds." : "This takes a few seconds."} Please keep this page open.
                   {server === "waking" && " The service is still starting, so the first time can take longer."}
                 </p>
               </div>
@@ -594,14 +686,31 @@ export default function Home() {
                       // eslint-disable-next-line @next/next/no-img-element -- previews are data URLs from the API
                       <img src={shown} alt={shownLabel} className="max-h-[70vh] w-full object-contain" />
                     )}
-                    {(busy === "update" || busy === "perfect" || busy === "layers") && (
+                    {!shown && (
+                      <p className="max-w-xs px-4 text-center text-sm text-muted">
+                        Nothing made yet. Use <b>Check my design</b> or <b>Make perfect outline border</b> below.
+                      </p>
+                    )}
+                    {(busy === "update" ||
+                      busy === "perfect" ||
+                      busy === "layers" ||
+                      busy === "aiAnalyse" ||
+                      busy === "aiLayers") && (
                       <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white/80 px-4 text-center backdrop-blur-[1px]">
                         <Spinner />
                         <p className="font-semibold">
-                          {busy === "perfect" ? "Making the border perfect…" : busy === "layers" ? "Finding the colours…" : "Updating…"}{" "}
+                          {busy === "perfect"
+                            ? "Making the border perfect…"
+                            : busy === "aiLayers"
+                              ? "Making the AI layers…"
+                              : busy === "aiAnalyse"
+                                ? "Checking the design…"
+                                : busy === "layers"
+                                  ? "Finding the colours…"
+                                  : "Updating…"}{" "}
                           {seconds} s
                         </p>
-                        {busy === "perfect" && (
+                        {(busy === "perfect" || busy === "aiLayers") && (
                           <p className="text-sm text-muted">Usually under a minute, sometimes up to a few minutes.</p>
                         )}
                       </div>
@@ -619,14 +728,30 @@ export default function Home() {
                   onDownload={(fmt) => save(fmt, fmt === "layers-svg" ? "svg" : fmt === "layers-psd" ? "psd" : "zip")}
                 />
               )}
-              <Summary result={result} />
+              {view === "ailayers" && result && (
+                <AiLayersPanel
+                  machine={machine}
+                  onMachine={setMachine}
+                  state={aiState}
+                  hidden={aiHidden}
+                  working={busy === "aiAnalyse" || busy === "aiLayers" ? busy : ""}
+                  busy={!!busy}
+                  downloading={downloading}
+                  onAnalyse={analyse}
+                  onMake={makeAi}
+                  onToggle={toggleAiLayer}
+                  onDownload={() => save("ai-layers-psd", "psd")}
+                  error={error}
+                />
+              )}
+              {SHOW_LOCAL && <Summary result={result} />}
               {perfectReady && (
                 <div className="flex flex-col gap-3 rounded-2xl border border-brand/40 bg-mint-soft p-4">
                   <div className="flex flex-col gap-1">
                     <p className="font-semibold">Make this perfect outline border</p>
                     <p className="text-sm text-muted">
-                      Get a clean, smooth outline of your design. The result appears as “Perfect border” next to Final
-                      result. Choose how:
+                      Get a clean, smooth outline of your design. The result appears as “Perfect border” above. Choose
+                      how:
                     </p>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
@@ -654,8 +779,8 @@ export default function Home() {
                   {chatOpen && (
                     <div className="flex flex-col gap-3 rounded-xl bg-white p-3">
                       <p className="text-sm text-muted">
-                        You can ask only for changes to your border image, for example “make the lines thinner”, “close the
-                        small gaps” or “remove the dots”. Other questions will not be answered.
+                        You can ask only for changes to your border image, for example “make the lines thinner”, “close
+                        the small gaps” or “remove the dots”. Other questions will not be answered.
                       </p>
                       <div
                         ref={chatBoxRef}
@@ -664,7 +789,9 @@ export default function Home() {
                         className="flex max-h-72 min-h-24 flex-col gap-2 overflow-y-auto rounded-lg bg-gray-50 p-3"
                       >
                         {chatLog.length === 0 && busy !== "chat" && (
-                          <p className="text-sm text-muted">No messages yet. Type what you want to change, or tap an example.</p>
+                          <p className="text-sm text-muted">
+                            No messages yet. Type what you want to change, or tap an example.
+                          </p>
                         )}
                         {chatLog.map((m, i) => (
                           <div
@@ -717,7 +844,10 @@ export default function Home() {
                           aria-label="Your message"
                           className="h-11 min-w-0 flex-1 rounded-xl border border-line bg-white px-3 disabled:opacity-50"
                         />
-                        <Button onClick={() => sendMessage(chatInput)} disabled={!!busy || chatUsedUp || !chatInput.trim()}>
+                        <Button
+                          onClick={() => sendMessage(chatInput)}
+                          disabled={!!busy || chatUsedUp || !chatInput.trim()}
+                        >
                           Send
                         </Button>
                       </form>
@@ -745,15 +875,22 @@ export default function Home() {
                   That size is too large to download. Lower the DPI or the width in Settings → Download settings.
                 </p>
               )}
-              <button
-                type="button"
-                onClick={() => save("zip", "zip")}
-                disabled={blocked || tooLarge}
-                className="inline-flex min-h-14 items-center justify-center gap-2 rounded-xl bg-btn px-6 text-lg font-semibold text-white shadow-sm hover:bg-btn-hover disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <DownloadIcon busy={downloading === "zip"} className="h-5 w-5" />
-                {downloading === "zip" ? "Preparing the ZIP…" : "Download all files (ZIP)"}
-              </button>
+              {!SHOW_LOCAL && !perfectImg && (
+                <p className="text-sm text-muted">
+                  Your files appear here after you make the perfect border or the AI layers.
+                </p>
+              )}
+              {SHOW_LOCAL && (
+                <button
+                  type="button"
+                  onClick={() => save("zip", "zip")}
+                  disabled={blocked || tooLarge}
+                  className="inline-flex min-h-14 items-center justify-center gap-2 rounded-xl bg-btn px-6 text-lg font-semibold text-white shadow-sm hover:bg-btn-hover disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <DownloadIcon busy={downloading === "zip"} className="h-5 w-5" />
+                  {downloading === "zip" ? "Preparing the ZIP…" : "Download all files (ZIP)"}
+                </button>
+              )}
               {perfectImg && (
                 <button
                   type="button"
@@ -766,9 +903,8 @@ export default function Home() {
                       {downloading === "perfect" ? "Preparing…" : "Perfect border (transparent PNG)"}
                     </span>
                     <span className="text-sm text-muted">
-                      Black lines on a transparent background, with no colour: open it in Photoshop as one layer and
-                      add colour layers under it. A picture only, so it is not in the SVG, PDF, EPS or DXF files. Also
-                      included in the ZIP.
+                      Black lines on a transparent background, with no colour: open it in Photoshop as one layer and add
+                      colour layers under it.
                     </span>
                   </span>
                 </button>
@@ -785,14 +921,14 @@ export default function Home() {
                       {downloading === "perfect-psd" ? "Preparing…" : "Perfect border with layers (PSD)"}
                     </span>
                     <span className="text-sm text-muted">
-                      One Photoshop file with separate layers: a white background, a layer for each colour of your photo,
-                      and your perfect border on top. If the photo has no colour, it has the background and the border.
-                      No extra cost.
+                      One Photoshop file with separate layers: a white background, a layer for each colour of your
+                      photo, and your perfect border on top. If the photo has no colour, it has the background and the
+                      border. No extra cost.
                     </span>
                   </span>
                 </button>
               )}
-              {chosen.length > 0 && (
+              {SHOW_LOCAL && chosen.length > 0 && (
                 <>
                   <p className="text-sm text-muted">Or download one file at a time:</p>
                   <div className="grid gap-2 sm:grid-cols-2">
@@ -815,16 +951,23 @@ export default function Home() {
                     ))}
                   </div>
                   {chosen.length > 1 && chosen.length < ready.length && (
-                    <Button kind="outline" onClick={downloadChosen} disabled={blocked || tooLarge} className="self-start">
+                    <Button
+                      kind="outline"
+                      onClick={downloadChosen}
+                      disabled={blocked || tooLarge}
+                      className="self-start"
+                    >
                       <Download className="h-5 w-5" aria-hidden /> Download my {chosen.length} chosen files
                     </Button>
                   )}
                 </>
               )}
-              <p className="text-sm text-muted">
-                Choose which file types to show in Settings → Download settings → Formats.
-                {!bw && " Vector, CAD and print files need the black & white output."}
-              </p>
+              {SHOW_LOCAL && (
+                <p className="text-sm text-muted">
+                  Choose which file types to show in Settings → Download settings → Formats.
+                  {!bw && " Vector, CAD and print files need the black & white output."}
+                </p>
+              )}
               <Button kind="ghost" onClick={startOver} className="self-start px-3">
                 <RefreshCw className="h-4 w-4" aria-hidden /> Start again with a new photo
               </Button>
@@ -835,7 +978,11 @@ export default function Home() {
         {/* Settings panel: next to the page on big screens, full screen on phones */}
         {settingsOpen && (
           <>
-            <div className="fixed inset-0 z-30 bg-ink/30 lg:hidden" onClick={() => setSettingsOpen(false)} aria-hidden />
+            <div
+              className="fixed inset-0 z-30 bg-ink/30 lg:hidden"
+              onClick={() => setSettingsOpen(false)}
+              aria-hidden
+            />
             <aside
               aria-label="Settings"
               className="panel-in fixed inset-y-0 right-0 z-40 flex w-full max-w-md flex-col bg-white shadow-2xl lg:sticky lg:top-6 lg:z-auto lg:max-h-[calc(100vh-3rem)] lg:w-96 lg:shrink-0 lg:rounded-3xl lg:border lg:border-line lg:shadow-sm"
@@ -958,7 +1105,11 @@ function DownloadIcon({ busy, className }: { busy: boolean; className: string })
 
 function Splash() {
   return (
-    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-6 bg-white" role="status" aria-label="Loading">
+    <div
+      className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-6 bg-white"
+      role="status"
+      aria-label="Loading"
+    >
       <div className="splash-pop flex flex-col items-center gap-3 text-center">
         <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">
           TextileBorder <span className="text-brand">OutlineTool</span>
@@ -973,7 +1124,11 @@ function Splash() {
 }
 
 function Card({ children }: { children: React.ReactNode }) {
-  return <section className="flex flex-col gap-4 rounded-3xl border border-line bg-white p-5 shadow-sm sm:p-6">{children}</section>;
+  return (
+    <section className="flex flex-col gap-4 rounded-3xl border border-line bg-white p-5 shadow-sm sm:p-6">
+      {children}
+    </section>
+  );
 }
 
 function CardTitle({ step, title }: { step: string; title: string }) {

@@ -14,7 +14,7 @@ type Props = {
   onDownload: (fmt: "layers-psd" | "layers-svg" | "layers-zip") => void;
 };
 
-/** The colours found in the photo as layers: hide one, merge two, choose how many, download. */
+/** The colours found in the photo as layers (free): hide one, merge two, choose how many, download. */
 export default function LayersPanel({ data, options, busy, downloading, onChange, onDownload }: Props) {
   const changed = JSON.stringify(options) !== JSON.stringify(DEFAULT_LAYER_OPTIONS);
   const share = (v: number) => (v < 0.01 ? "<1%" : `${Math.round(v * 100)}%`);
@@ -22,7 +22,7 @@ export default function LayersPanel({ data, options, busy, downloading, onChange
   return (
     <div className="flex flex-col gap-4 rounded-2xl border border-line bg-white p-4">
       <div className="flex flex-col gap-1">
-        <h3 className="font-semibold">Colour layers</h3>
+        <h3 className="font-semibold">Colour layers (free)</h3>
         <p className="text-sm text-muted">
           Every colour of your design is one layer, so one change recolours all areas of that colour. Untick a layer to
           check it, or merge two colours that should be one layer.
@@ -133,9 +133,10 @@ export default function LayersPanel({ data, options, busy, downloading, onChange
         </Button>
       </div>
       <p className="text-xs text-muted">
-        The PSD is one file for Photoshop: a white background, a layer per colour and the lines on top. The SVG keeps each
-        colour as its own layer (Illustrator, CorelDRAW, Inkscape). The ZIP has one transparent PNG per colour and one for
-        the lines. Merged colours are one layer in every file; hidden layers are still included.
+        The PSD is one file for Photoshop: a white background, your original photo as a hidden layer (switch it on with the
+        eye icon to compare), a layer per colour and the lines on top. The SVG is the vector version, with each colour as its
+        own layer (Illustrator, CorelDRAW, Inkscape). The ZIP has one transparent PNG per colour and one for the lines. Merged
+        colours are one layer in every file; hidden layers are still included.
       </p>
     </div>
   );

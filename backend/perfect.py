@@ -9,7 +9,7 @@ in the chosen line colour.
 
 Needs OPENAI_API_KEY in backend/.env (or the environment). Optional:
 OPENAI_IMAGE_MODEL (default gpt-image-2), OPENAI_IMAGE_QUALITY (default medium) and
-OPENAI_INPUT_FIDELITY (gpt-image-1 models only; default low, high = closer but more expensive).
+OPENAI_INPUT_FIDELITY (gpt-image-1 and gpt-image-1.5 only; default low, high = closer but more expensive).
 """
 import base64
 import os
@@ -115,26 +115,20 @@ def to_transparent(rgb, color="#000000"):
     return out
 
 
-def make_perfect(image, kind="sketch", color="#000000", extra=None):
-    """image: uint8 gray or RGB picture to redraw. kind: 'sketch' or 'color' (picks the prompt).
-    Returns (rgb, meta): rgb is a uint8 image (lines in `color` on white), long side MAX_SIDE;
-    meta is {model, quality, size, usage} for the cost log (usage as OpenAI reports it, or None).
-    extra: one change asked for in the chat (already checked by chat.py), added to the prompt.
-    Makes exactly one request: no automatic retry, because every request is paid."""
+def _edit(image, prompt, model=None, extra=None):
+    """One paid request to the image model: the picture and the prompt go in, the model's picture comes back.
+    extra: more form fields for the request (for example {"background": "transparent"}).
+    Returns (png bytes, meta). meta is {model, quality, size, usage} for the cost log.
+    No automatic retry, because every request is paid."""
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         raise PerfectError("Make border perfect is not set up: add OPENAI_API_KEY to backend/.env")
-    if kind not in PROMPTS:
-        raise PerfectError(f"Unknown picture type: {kind}")
-    model = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
+    model = model or os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
     quality = os.environ.get("OPENAI_IMAGE_QUALITY", "medium")
 
-    h, w = image.shape[:2]
-    f = MAX_SIDE / max(h, w)                 # always the working size, also for small photos
-    out_w, out_h = int(round(w * f)), int(round(h * f))
-
     # Stretch to the model's size (no padding: the model fills the whole canvas, so padding got cut off);
-    # the answer is stretched back below, which restores the original proportions.
+    # the answer is stretched back by the caller, which restores the original proportions.
+    h, w = image.shape[:2]
     size = _size_for(w, h)
     tw, th = (int(v) for v in size.split("x"))
     send = cv2.resize(image, (tw, th), interpolation=cv2.INTER_AREA)
@@ -142,11 +136,11 @@ def make_perfect(image, kind="sketch", color="#000000", extra=None):
         send = cv2.cvtColor(send, cv2.COLOR_RGB2BGR)
     ok, png = cv2.imencode(".png", send)
 
-    prompt = PROMPTS[kind] + (CHANGE_NOTE.format(extra=extra) if extra else "")
     data = {"model": model, "prompt": prompt, "quality": quality, "size": size, "n": "1"}
-    if model.startswith("gpt-image-1"):
-        # only gpt-image-1 models take this: "low" (cheaper) or "high" (closer to the picture, costs more)
+    if model in ("gpt-image-1", "gpt-image-1.5"):
+        # only these models take this: "low" (cheaper) or "high" (closer to the picture, costs more)
         data["input_fidelity"] = os.environ.get("OPENAI_INPUT_FIDELITY", "low")
+    data.update(extra or {})
     files = {"image": ("picture.png", png.tobytes(), "image/png")}
     try:
         r = httpx.post(API, data=data, files=files, headers={"Authorization": f"Bearer {key}"}, timeout=300)
@@ -170,7 +164,24 @@ def make_perfect(image, kind="sketch", color="#000000", extra=None):
         b64 = body["data"][0]["b64_json"]
     except (KeyError, IndexError, ValueError):
         raise PerfectError("OpenAI did not return an image. Please try again.")
-    res = cv2.imdecode(np.frombuffer(base64.b64decode(b64), np.uint8), cv2.IMREAD_GRAYSCALE)
+    return base64.b64decode(b64), {"model": model, "quality": quality, "size": size, "usage": body.get("usage")}
+
+
+def make_perfect(image, kind="sketch", color="#000000", extra=None):
+    """image: uint8 gray or RGB picture to redraw. kind: 'sketch' or 'color' (picks the prompt).
+    Returns (rgb, meta): rgb is a uint8 image (lines in `color` on white), long side MAX_SIDE;
+    meta is {model, quality, size, usage} for the cost log (usage as OpenAI reports it, or None).
+    extra: one change asked for in the chat (already checked by chat.py), added to the prompt.
+    Makes exactly one request: no automatic retry, because every request is paid."""
+    if kind not in PROMPTS:
+        raise PerfectError(f"Unknown picture type: {kind}")
+    h, w = image.shape[:2]
+    f = MAX_SIDE / max(h, w)                 # always the working size, also for small photos
+    out_w, out_h = int(round(w * f)), int(round(h * f))
+
+    prompt = PROMPTS[kind] + (CHANGE_NOTE.format(extra=extra) if extra else "")
+    raw, meta = _edit(image, prompt)
+    res = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
     if res is None:
         raise PerfectError("OpenAI returned an image that could not be read.")
 
@@ -183,4 +194,4 @@ def make_perfect(image, kind="sketch", color="#000000", extra=None):
     c = (color or "#000000").lstrip("#")
     ink = np.array([int(c[i:i + 2], 16) for i in (0, 2, 4)], np.float32)
     rgb = (255 * (1 - a) + ink * a + 0.5).astype(np.uint8)
-    return rgb, {"model": model, "quality": quality, "size": size, "usage": body.get("usage")}
+    return rgb, meta

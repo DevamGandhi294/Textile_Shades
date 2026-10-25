@@ -351,7 +351,7 @@ def refit_to_lines(labels, lines, line_width):
     out = np.full((h, w), -1, np.int8)
     areas, n = closed_areas(lines)
     if n == 0 or not (labels >= 0).any():
-        return out
+        return labels.copy()                  # no closed box in the new lines: keep the colours as they are
     K = int(labels.max()) + 1
     has = (areas > 0) & (labels >= 0)
     per = np.bincount(areas[has].astype(np.int64) * K + labels[has], minlength=(n + 1) * K).reshape(n + 1, K)
@@ -367,6 +367,8 @@ def refit_to_lines(labels, lines, line_width):
     out[m] = target[areas[m]]
     mm = mixed[areas] & (labels >= 0)
     out[mm] = labels[mm]
+    outside = (areas == 0) & ~lines & (labels >= 0)          # a background that touches the page edge is not a box
+    out[outside] = labels[outside]
     free = out < 0
     dist, idx = ndimage.distance_transform_edt(free, return_indices=True)
     fill = lines & free & (dist <= line_width * 1.5 + 2)
@@ -376,24 +378,48 @@ def refit_to_lines(labels, lines, line_width):
 
 # ----------------------------------------------------------------- PSD
 
-def write_layers_psd(path, labels, palette, lines_alpha, line_rgb, dpi, lines_name="Lines"):
-    """One layered PSD (opens in Photoshop with a layers list): a white "Background", a layer per colour
-    ("01 Pink", ...) and the lines on top, all with the same position and size.
-
-    lines_alpha: uint8 (h, w) transparency of the lines (255 = line); soft edges are kept.
-    dpi: pixels per inch of the image (stored in the file)."""
+def new_psd(w, h, dpi):
+    """An empty RGB PSD of w x h pixels, with the resolution (pixels per inch) stored in it."""
     from psd_tools import PSDImage
-    from psd_tools.api.layers import PixelLayer
     from psd_tools.constants import Resource
     from psd_tools.psd.image_resources import ImageResource, ResoulutionInfo
 
-    h, w = labels.shape
     psd = PSDImage.new("RGB", (w, h), color=(255, 255, 255))
     fixed = int(round(dpi * 65536))                                   # pixels per inch as a 16.16 number
     psd.image_resources[Resource.RESOLUTION_INFO] = ImageResource(
         key=Resource.RESOLUTION_INFO,
         data=ResoulutionInfo(horizontal=fixed, horizontal_unit=1, width_unit=1,
                              vertical=fixed, vertical_unit=1, height_unit=1))
+    return psd
+
+
+def add_rgba_layer(psd, name, rgba):
+    """Add a named pixel layer on top: rgba is uint8 (h, w, 4) at the canvas size. It is cut to the area that is
+    not transparent; a layer with nothing in it is added as one empty pixel, so its name is still in the file."""
+    from psd_tools.api.layers import PixelLayer
+
+    ys, xs = np.nonzero(rgba[..., 3])
+    if len(ys):
+        y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+    else:
+        y0, y1, x0, x1 = 0, 1, 0, 1
+    crop = np.ascontiguousarray(rgba[y0:y1, x0:x1])
+    psd.append(PixelLayer.frompil(Image.fromarray(crop, "RGBA"), psd, name, top=y0, left=x0))
+
+
+def write_layers_psd(path, labels, palette, lines_alpha, line_rgb, dpi, lines_name="Lines", reference=None):
+    """One layered PSD (opens in Photoshop with a layers list): a white "Background", a layer per colour
+    ("01 Pink", ...) and the lines on top, all with the same position and size.
+
+    lines_alpha: uint8 (h, w) transparency of the lines (255 = line); soft edges are kept.
+    dpi: pixels per inch of the image (stored in the file).
+    reference: optional uint8 RGB picture (the original photo, same size) added as a HIDDEN layer, so the
+    designer can look at the real colours and shading without it being in the way."""
+    from psd_tools.api.layers import PixelLayer
+    from psd_tools.constants import Compression
+
+    h, w = labels.shape
+    psd = new_psd(w, h, dpi)
 
     def add(name, mask_alpha, rgb):
         """A layer in the colour `rgb` where mask_alpha > 0, cut to the area it covers."""
@@ -407,6 +433,11 @@ def write_layers_psd(path, labels, palette, lines_alpha, line_rgb, dpi, lines_na
         psd.append(PixelLayer.frompil(Image.fromarray(rgba, "RGBA"), psd, name, top=int(y0), left=int(x0)))
 
     add("Background", np.full((h, w), 255, np.uint8), (255, 255, 255))
+    if reference is not None and reference.shape[:2] == (h, w):
+        ref = PixelLayer.frompil(Image.fromarray(reference, "RGB"), psd, "Reference (original photo)", top=0, left=0,
+                                 compression=Compression.ZIP)
+        ref.visible = False
+        psd.append(ref)
     for pos, e in enumerate(palette, 1):
         add(f"{pos:02d} {e['name']}", np.where(labels == e["id"], 255, 0).astype(np.uint8), e["rgb"])
     add(lines_name, lines_alpha, line_rgb)

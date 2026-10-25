@@ -11,8 +11,11 @@ uploaded image; the Session is kept in memory so a settings change only re-runs 
     POST /api/sessions/{id}/update      new settings    -> previews
     POST /api/sessions/{id}/perfect     ?source=sketch|color  -> AI redraw (paid, limited; see README)
     POST /api/sessions/{id}/chat        {message}  -> ask for a change in words (image edits only)
-    POST /api/sessions/{id}/layers      {colors, merge, hidden} -> colour layers (free, offline)
-    GET  /api/sessions/{id}/download    ?fmt=zip|png|pdf|svg|eps|dxf|tiff|bmp|perfect|layers-svg|layers-zip|layers-psd|perfect-psd
+    POST /api/sessions/{id}/layers      {colors, merge, hidden} -> colour layers read from the photo (free, offline)
+    POST /api/sessions/{id}/ai-analyse  {machine} -> AI layers step 1: what the design is and which layers (cheap)
+    POST /api/sessions/{id}/ai-layers   AI layers steps 2-3: one image call per layer (paid; see README)
+    GET  /api/sessions/{id}/ai-layers   the AI layers made so far, with a preview (free)
+    GET  /api/sessions/{id}/download    ?fmt=zip|png|pdf|svg|eps|dxf|tiff|bmp|perfect|layers-svg|layers-zip|layers-psd|perfect-psd|ai-layers-psd
     GET  /api/health
 """
 import argparse
@@ -48,6 +51,7 @@ from sketchclean.export import Page
 from sketchclean.imageio import hex_rgb, load_rgb
 from sketchclean.lines import line_width
 import chat
+import layer_pipeline
 import perfect
 
 HERE = Path(__file__).resolve().parent
@@ -65,6 +69,9 @@ MAX_SESSIONS = 20                    # each one holds a few full-size images in 
 SESSION_TTL = 60 * 60                # seconds without use before a session is dropped
 ALL_FORMATS = ("png", "tiff", "bmp", "svg", "pdf", "eps", "dxf")
 IMAGE_TYPES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+# The upload makes only the scan (a few seconds), which is all the AI needs. The slow local line steps (clean, gaps,
+# closed boxes) run later, only when a file that needs them is downloaded. LINES_ON_UPLOAD=1 makes them on upload again.
+LINES_ON_UPLOAD = os.environ.get("LINES_ON_UPLOAD", "0") == "1"
 
 # comma-separated list of website addresses allowed to call the API from a browser
 # (default: the local Next.js dev server; set ALLOWED_ORIGINS to the live site address)
@@ -121,6 +128,9 @@ class Entry:
         self.perfect_calls = 0               # paid image calls used (or running) for this photo
         self.chat_calls = 0                  # chat messages used for this photo
         self.layer_state = {"colors": 0, "merge": []}   # what the user last chose in the Layers tab (used by the downloads)
+        self.ai_plan = None                  # AI layers, step 1: the analysis + machine + model (layer_pipeline.py)
+        self.ai_layers = None                # the AI layers that were made: {"plan", "layers": [(name, rgba)]}
+        self.ai_runs = 0                     # times the AI layers were made for this photo (a run = one image call per layer)
         self.chat_history = []               # last on-topic turns, so "make it thinner" follows the last change
 
 
@@ -175,6 +185,9 @@ def _log_usage(sid, source, meta):
         line = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"), "session": sid,
                 "kind": meta.get("kind", "image"), "model": meta.get("model"), "quality": meta.get("quality"),
                 "size": meta.get("size"), "source": source, "usage": meta.get("usage")}
+        for extra in ("analysis", "layer", "prompt"):         # AI layers: what the AI found, which layer, the prompt
+            if meta.get(extra):
+                line[extra] = meta[extra]
         with open(USAGE_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(line) + "\n")
     except Exception:
@@ -224,6 +237,19 @@ def _data_url(rgb, max_w=1600, fmt=".png"):
 
 def _result(sid: str, entry: Entry):
     s = entry.sess
+    if s.clean is None:                       # only the scan was made (LINES_ON_UPLOAD is off)
+        h, w = s.scan.preview.shape[:2]
+        return {
+            "id": sid,
+            "name": entry.stem,
+            "previews": {"scan": _data_url(s.preview_scan(), fmt=".jpg"), "clean": None, "final": None, "check": None},
+            "info": {"output": s.settings.clean.output, "width": int(w), "height": int(h), "lines_from": None,
+                     "closed_boxes": None, "gaps_joined": None, "loose_ends": None, "ai_note": None,
+                     "seconds": s.timing},
+            "formats": [],
+            "perfect": _perfect_usage(entry),
+            "chat": _chat_usage(entry),
+        }
     rep = s.report()
     return {
         "id": sid,
@@ -305,7 +331,10 @@ def create_session(file: UploadFile = File(...), auto_crop: bool = Form(True), s
             f.write(chunk)
     try:
         sess = Session(src, auto_crop=auto_crop)
-        sess.update(s)
+        if LINES_ON_UPLOAD:
+            sess.update(s)
+        else:
+            sess.settings = s                 # the line steps run later, when a file needs them
     except Exception:
         log.exception("could not process upload %r", name)       # real reason in the server log only
         shutil.rmtree(folder, ignore_errors=True)
@@ -321,21 +350,45 @@ def update_session(sid: str, settings: SettingsIn):
     s = settings.to_settings()
     with entry.lock:
         entry.sess.update(s)
-        entry.layer_state = {"colors": 0, "merge": []}      # the layers belong to the old lines
+        entry.layer_state = {"colors": 0, "merge": []}      # the photo layers belong to the old lines
         return _result(sid, entry)
+
+
+def _take_image_slot(entry):
+    """Count one paid image call for this photo (call with entry.lock held)."""
+    max_per_session = _env_int("PERFECT_MAX_PER_SESSION", 3)
+    if entry.perfect_calls >= max_per_session:
+        raise HTTPException(429, f"Make border perfect can be used {max_per_session} times per photo. "
+                                 "Upload the photo again to try more.")
+    entry.perfect_calls += 1
+
+
+def _take_hourly_slot(entry):
+    """Count one paid image call in the rolling hour (call without the lock); gives the photo's slot back if full."""
+    stamp = _reserve_hourly()
+    if stamp is None:
+        with entry.lock:
+            entry.perfect_calls -= 1
+        raise HTTPException(429, "Make border perfect has been used too often in the last hour. "
+                                 "Please try again later.")
+    return stamp
+
+
+def _give_back_image_slot(entry, stamp):
+    """Nothing was made: give both slots back."""
+    with entry.lock:
+        entry.perfect_calls -= 1
+    _release_hourly(stamp)
 
 
 def _paid_redraw(sid, entry, source, extra=None, refine=False):
     """One paid image call. refine=False redraws the scanned image; refine=True (chat) starts from the
     last perfect border when there is one. Limits: PERFECT_MAX_PER_SESSION and PERFECT_MAX_PER_HOUR."""
-    max_per_session = _env_int("PERFECT_MAX_PER_SESSION", 3)
     # copy what the call needs and reserve this photo's slot, then let go of the lock:
     # the paid call can take a minute and must not block other requests for this photo
     with entry.lock:
-        if entry.perfect_calls >= max_per_session:
-            raise HTTPException(429, f"Make border perfect can be used {max_per_session} times per photo. "
-                                     "Upload the photo again to try more.")
         s = entry.sess
+        _take_image_slot(entry)
         if refine and entry.perfect is not None and entry.perfect.exists():
             picture = load_rgb(entry.perfect)             # transparent lines are put on white paper again
         else:
@@ -343,20 +396,12 @@ def _paid_redraw(sid, entry, source, extra=None, refine=False):
             if not refine:
                 entry.chat_history = []           # a fresh redraw starts a new conversation
         color, dpi = s.settings.output.color, s.settings.output.dpi
-        entry.perfect_calls += 1
-    stamp = _reserve_hourly()
-    if stamp is None:
-        with entry.lock:
-            entry.perfect_calls -= 1
-        raise HTTPException(429, "Make border perfect has been used too often in the last hour. "
-                                 "Please try again later.")
+    stamp = _take_hourly_slot(entry)
 
     try:
         rgb, meta = perfect.make_perfect(picture, "sketch" if source == "chat" else source, color, extra)  # one prompt for all
     except perfect.PerfectError as e:
-        with entry.lock:
-            entry.perfect_calls -= 1          # nothing was made, so the slot is given back
-        _release_hourly(stamp)
+        _give_back_image_slot(entry, stamp)    # nothing was made, so the slots are given back
         raise HTTPException(502, str(e))
     _log_usage(sid, source, meta)
 
@@ -451,55 +496,218 @@ class LayersIn(BaseModel):
     show_lines: bool = True
 
 
+def _layer_data(entry, colors, merge):
+    """The free layers read from the photo: (base, labels after merging, palette, lines alpha)."""
+    try:
+        base = entry.sess.ensure_lines().layer_base(colors)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    labels, palette = layers.apply_merge(base, merge)
+    return base, labels, palette, base.lines.astype(np.uint8) * 255
+
+
+def _palette_json(palette):
+    return [{k: e[k] for k in ("id", "hex", "name", "share")} for e in palette]
+
+
 @app.post("/api/sessions/{sid}/layers")
 def colour_layers(sid: str, body: LayersIn):
-    """Colour layers of the black & white result: the colours found in the photo, and a preview with the
-    chosen layers hidden. Free and offline (no AI). The choices are remembered for the layer downloads."""
+    """Colour layers of the black & white result, read from the photo (free, offline): the colours found, and a
+    preview with the chosen layers hidden. The choices are remembered for the layer downloads."""
     entry = _get(sid)
     with entry.lock:
         sess = entry.sess
-        try:
-            base = sess.layer_base(body.colors)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        labels, palette = layers.apply_merge(base, body.merge)
+        base, labels, palette, _ = _layer_data(entry, body.colors, body.merge)
         entry.layer_state = {"colors": body.colors, "merge": list(body.merge)}
         img = layers.composite(labels, palette, set(body.hidden), base.lines,
                                hex_rgb(sess.settings.output.color), body.show_lines)
-    return {"image": _data_url(img),
-            "palette": [{k: e[k] for k in ("id", "hex", "name", "share")} for e in palette]}
+    return {"image": _data_url(img), "palette": _palette_json(palette)}
 
+
+# ----------------------------------------------------------------- AI layers (layer_pipeline.py)
+
+class AnalyseIn(BaseModel):
+    machine: Literal["embroidery", "print", "cad"]
+
+
+def _ai_runs(entry):
+    return {"used": entry.ai_runs, "limit": _env_int("AI_LAYERS_MAX_RUNS_PER_SESSION", 2)}
+
+
+def _ai_json(entry, hidden=()):
+    """The AI layers state for the website: the plan, the runs used and, when made, a preview and the layer list."""
+    out = {"plan": entry.ai_plan, "runs": _ai_runs(entry), "made": entry.ai_layers is not None}
+    ai = entry.ai_layers
+    if ai:
+        out["image"] = _data_url(layer_pipeline.composite(ai["layers"], ai["plan"]["mirror"], set(hidden)))
+        out["layers"] = [{"id": i, "name": name} for i, (name, _) in enumerate(ai["layers"])]
+    return out
+
+
+def _take_chat_slot(entry):
+    """Count one message of the chat budget for this photo and for the hour (the analysis costs about the same)."""
+    max_messages = _env_int("CHAT_MAX_MESSAGES_PER_SESSION", 20)
+    with entry.lock:
+        if entry.chat_calls >= max_messages:
+            raise HTTPException(429, f"You can send {max_messages} chat messages per photo. "
+                                     "Upload the photo again to continue.")
+        entry.chat_calls += 1
+    stamp = _reserve(_chat_times, "CHAT_MAX_PER_HOUR", 300)
+    if stamp is None:
+        with entry.lock:
+            entry.chat_calls -= 1
+        raise HTTPException(429, "The AI has been used too often in the last hour. Please try again later.")
+    return stamp
+
+
+@app.post("/api/sessions/{sid}/ai-analyse")
+def ai_analyse(sid: str, body: AnalyseIn, authorization: Optional[str] = Header(None)):
+    """AI layers, step 1 (cheap): one AI call looks at the uploaded photo and decides colour or line, complete or
+    not, symmetric or not and which layers to make for the chosen machine. Nothing is drawn yet, so the user can
+    see how many image calls the layers will need before any of them is paid. Needs API_TOKEN (if set)."""
+    _require_token(authorization)
+    entry = _get(sid)
+    stamp = _take_chat_slot(entry)
+    try:
+        analysis, meta = layer_pipeline.analyse_image(load_rgb(entry.sess.path), body.machine)
+    except layer_pipeline.PipelineError as e:
+        with entry.lock:
+            entry.chat_calls -= 1                 # nothing was answered, so the slot is given back
+        _release(_chat_times, stamp)
+        raise HTTPException(502, str(e))
+    plan = {**analysis, "machine": body.machine, "model": layer_pipeline.pick_model(analysis)}
+    _log_usage(sid, "ai-analyse", {**meta, "kind": "chat", "analysis": {
+        "machine": body.machine, "image_type": analysis["image_type"], "is_complete": analysis["is_complete"],
+        "is_symmetric": analysis["is_symmetric"], "layers": [x["name"] for x in analysis["layers"]]}})
+    with entry.lock:
+        entry.ai_plan = plan
+    return _ai_json(entry)
+
+
+@app.post("/api/sessions/{sid}/ai-layers")
+def make_ai_layers(sid: str, authorization: Optional[str] = Header(None)):
+    """AI layers, steps 2 to 3: one image call per layer of the plan from /ai-analyse, using the model chosen for
+    the plan (complete designs and incomplete ones use different models). The calls count in the hourly image limit,
+    and the number of runs per photo is limited (AI_LAYERS_MAX_RUNS_PER_SESSION). Needs API_TOKEN (if set)."""
+    _require_token(authorization)
+    entry = _get(sid)
+    limit = _env_int("AI_LAYERS_MAX_RUNS_PER_SESSION", 2)
+    with entry.lock:
+        if entry.ai_plan is None:
+            raise HTTPException(400, "Check the design first: choose the machine and press Check my design.")
+        if entry.ai_runs >= limit:
+            raise HTTPException(429, f"The AI layers can be made {limit} times per photo. Upload the photo again to try more.")
+        entry.ai_runs += 1
+        plan, path = dict(entry.ai_plan), entry.sess.path
+    n = len(plan["layers"])
+    stamps = []
+    for _ in range(n):                            # one hourly slot per image call; all or nothing
+        stamp = _reserve_hourly()
+        if stamp is None:
+            for taken in stamps:
+                _release_hourly(taken)
+            with entry.lock:
+                entry.ai_runs -= 1
+            raise HTTPException(429, "The AI layers have been used too often in the last hour. Please try again later.")
+        stamps.append(stamp)
+
+    try:
+        results = layer_pipeline.generate_all(load_rgb(path), plan)
+    except Exception:
+        log.exception("AI layers failed")
+        for taken in stamps:
+            _release_hourly(taken)
+        with entry.lock:
+            entry.ai_runs -= 1
+        raise HTTPException(500, "Something went wrong while making the layers. Please try again.")
+
+    made = [r for r in results if r["rgba"] is not None]
+    failed = [r for r in results if r["rgba"] is None]
+    for _ in failed:
+        _release_hourly(stamps.pop())             # a layer that could not be made was not paid
+    for r in made:
+        _log_usage(sid, "ai-layer", {**r["meta"], "layer": r["name"], "prompt": r["prompt"]})
+    with entry.lock:
+        if not entry.folder.exists():              # the photo expired while the calls were running
+            raise HTTPException(404, "This picture has expired. Please upload it again.")
+        if made:
+            h, w = made[0]["rgba"].shape[:2]      # the background colour is one solid layer at the bottom (free)
+            bg = ("Background colour", layer_pipeline.background_layer(plan, (w, h)))
+            entry.ai_layers = {"plan": plan, "layers": [bg] + [(r["name"], r["rgba"]) for r in made]}
+        else:
+            entry.ai_runs -= 1                    # nothing was made: the run is not counted
+    if failed:
+        names = ", ".join(r["name"] for r in failed)
+        kept = f" The other {len(made)} were kept." if made else ""
+        raise HTTPException(502, f"{len(failed)} of {n} layers could not be made ({names}): {failed[0]['error']}{kept}")
+    return _ai_json(entry)
+
+
+@app.get("/api/sessions/{sid}/ai-layers")
+def get_ai_layers(sid: str, hidden: str = ""):
+    """The AI layers state (free): the plan and, when made, a preview with the layers listed in `hidden`
+    (comma-separated numbers) left out."""
+    entry = _get(sid)
+    off = {int(x) for x in hidden.split(",") if x.strip().isdigit()}
+    with entry.lock:
+        return _ai_json(entry, off)
+
+
+def _download_ai_layers(entry):
+    """ai-layers-psd: ONE PSD with a named layer per AI layer (bottom to top), a white background and the
+    original photo as a hidden layer. A symmetric design is mirrored here."""
+    with entry.lock:
+        ai = entry.ai_layers
+        if ai is None:
+            raise HTTPException(404, "Make the AI layers first.")
+        sess = entry.sess
+        mirror = ai["plan"]["mirror"]
+        width = ai["layers"][0][1].shape[1] * (2 if mirror else 1)
+        out = sess.settings.output
+        dpi = width / (out.width_cm / 2.54) if out.width_cm > 0 else out.dpi      # so the file has the chosen size
+        folder = entry.folder / "layers"
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True)
+        path = folder / f"{entry.stem}_ai_layers.psd"
+        try:
+            layer_pipeline.export_psd(path, ai["layers"], mirror, dpi, reference=load_rgb(sess.path))
+        except layer_pipeline.PipelineError as e:
+            raise HTTPException(400, str(e))
+        return FileResponse(path, filename=path.name, media_type="image/vnd.adobe.photoshop")
+
+
+# ----------------------------------------------------------------- downloads of the free layers
 
 def _download_layers(entry, fmt):
     """layers-svg: one SVG, a group per colour + the lines. layers-zip: a transparent PNG per colour.
-    layers-psd: one PSD with a layer per colour and the lines on top."""
+    layers-psd: one PSD with a layer per colour and the lines on top (and the original photo as a hidden layer).
+    The layers are the ones last chosen in the Layers tab."""
     with entry.lock:
         sess = entry.sess
+        state = entry.layer_state
+        base, labels, palette, alpha = _layer_data(entry, state["colors"], state["merge"])
         try:
-            base = sess.layer_base(entry.layer_state["colors"])
             work_h, work_w = sess.clean.image.shape
             page = Page(work_w, work_h, sess.settings.output.dpi, sess.settings.output.width_cm)
         except ValueError as e:
             raise HTTPException(422 if "too large" in str(e) else 400, str(e))
-        labels, palette = layers.apply_merge(base, entry.layer_state["merge"])
         if not palette:
             raise HTTPException(400, "No colours were found in this photo, so there are no colour layers.")
         out = entry.folder / "layers"
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir(parents=True)
         line_hex = sess.settings.output.color
+        dpi = sess.settings.output.dpi / page.scale        # the files have the working size: scale the DPI to match
         if fmt == "layers-svg":
             path = out / f"{entry.stem}_layers.svg"
             layers.write_layers_svg(path, labels, palette, sess.even.shapes, page, line_hex)
             return FileResponse(path, filename=path.name, media_type="image/svg+xml")
         if fmt == "layers-psd":
             path = out / f"{entry.stem}_layers.psd"
-            layers.write_layers_psd(path, labels, palette, base.lines.astype(np.uint8) * 255, hex_rgb(line_hex),
-                                    sess.settings.output.dpi / page.scale)
+            layers.write_layers_psd(path, labels, palette, alpha, hex_rgb(line_hex), dpi, reference=sess.scan.color)
             return FileResponse(path, filename=path.name, media_type="image/vnd.adobe.photoshop")
         path = out / f"{entry.stem}_layers.zip"
-        # the PNGs have the working size, so their DPI is scaled to give the chosen physical size
-        layers.write_layers_zip(path, labels, palette, base.lines, hex_rgb(line_hex), sess.settings.output.dpi / page.scale)
+        layers.write_layers_zip(path, labels, palette, base.lines, hex_rgb(line_hex), dpi)
         return FileResponse(path, filename=path.name, media_type="application/zip")
 
 
@@ -509,7 +717,7 @@ def _download_perfect_psd(entry):
     with entry.lock:
         if entry.perfect is None or not entry.perfect.exists():
             raise HTTPException(404, "Press Make border perfect first.")
-        sess = entry.sess
+        sess = entry.sess.ensure_lines()     # the colour layers follow the local lines (made now if needed)
         try:
             base = sess.layer_base(entry.layer_state["colors"])
             work_h, work_w = sess.clean.image.shape
@@ -529,7 +737,8 @@ def _download_perfect_psd(entry):
         out.mkdir(parents=True)
         path = out / f"{entry.stem}_perfect_layers.psd"
         layers.write_layers_psd(path, fitted, palette, alpha, hex_rgb(sess.settings.output.color),
-                                sess.settings.output.dpi / page.scale, lines_name="Perfect border")
+                                sess.settings.output.dpi / page.scale, lines_name="Perfect border",
+                                reference=sess.scan.color)
         return FileResponse(path, filename=path.name, media_type="image/vnd.adobe.photoshop")
 
 
@@ -542,6 +751,8 @@ def download(sid: str, fmt: str = "zip"):
         if entry.perfect is None or not entry.perfect.exists():
             raise HTTPException(404, "Press Make border perfect first.")
         return FileResponse(entry.perfect, filename=entry.perfect.name)
+    if fmt == "ai-layers-psd":
+        return _download_ai_layers(entry)
     if fmt == "perfect-psd":
         return _download_perfect_psd(entry)
     if fmt in ("layers-svg", "layers-zip", "layers-psd"):
@@ -552,7 +763,7 @@ def download(sid: str, fmt: str = "zip"):
         out = entry.folder / "files"
         shutil.rmtree(out, ignore_errors=True)
         try:
-            files = entry.sess.export(out, entry.stem)
+            files = entry.sess.ensure_lines().export(out, entry.stem)
         except ValueError as e:                  # Page: output size over the pixel limit
             raise HTTPException(422, str(e))
         if fmt == "zip":

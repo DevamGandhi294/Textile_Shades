@@ -29,7 +29,7 @@ export type PerfectUsage = { used: number; limit: number };
 export type Result = {
   id: string;
   name: string;
-  previews: { scan: string; clean: string; final: string; check: string | null };
+  previews: { scan: string; clean: string | null; final: string | null; check: string | null }; // null: not made on upload
   info: {
     output: "bw" | "scan";
     width: number;
@@ -175,6 +175,47 @@ export function getLayers(id: string, options: LayerOptions) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(options),
   });
+}
+
+// AI layers (paid): the AI checks the design (step 1, cheap), then draws one picture per layer. Both go through this
+// website's server routes, so the secret token stays secret.
+export type Machine = "embroidery" | "print" | "cad";
+export type AiPlan = {
+  image_type: "line" | "color";
+  is_complete: boolean;
+  is_symmetric: boolean;
+  mirror: boolean; // the left half is drawn and mirrored
+  background_color: string; // one solid layer at the bottom (no AI call)
+  layers: { name: string; description: string; border_color: string }[]; // outlines only, in border_color
+  machine: Machine;
+  model: string; // the image model chosen for this design
+};
+export type AiLayersState = {
+  plan: AiPlan | null;
+  runs: { used: number; limit: number };
+  made: boolean;
+  image?: string; // preview of the layers stacked
+  layers?: { id: number; name: string }[];
+};
+
+export function analyseDesign(id: string, machine: Machine) {
+  const q = new URLSearchParams({ sid: id });
+  return call<AiLayersState>(`/api/ai-analyse?${q}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ machine }),
+  });
+}
+
+export function makeAiLayers(id: string) {
+  const q = new URLSearchParams({ sid: id });
+  return call<AiLayersState>(`/api/ai-layers?${q}`, { method: "POST" });
+}
+
+// The layers made so far, with the listed ones left out of the preview (free).
+export function getAiLayers(id: string, hidden: number[]) {
+  const q = new URLSearchParams({ hidden: hidden.join(",") });
+  return call<AiLayersState>(`${API_URL}/api/sessions/${id}/ai-layers?${q}`, { method: "GET" });
 }
 
 function fileNameFrom(res: Response, fallback: string) {
