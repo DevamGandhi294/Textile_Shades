@@ -17,9 +17,9 @@ const MACHINES: { value: Machine; label: string; hint: string }[] = [
 ];
 
 /**
- * AI layers: the AI checks the design (cheap), then redraws it object by object as one outline layer each,
- * in the layer's own colour and with no fill. The background colour is one more layer. Every layer is one
- * paid AI picture, so the cost is shown before anything is made.
+ * AI layers: the AI checks the design (cheap), then traces the whole design as outlines in ONE paid picture,
+ * which the server cuts into one layer per part by the photo's colours (so the layers always line up), each in
+ * its own colour and with no fill. The background colour is one more layer. The cost is shown before anything is made.
  */
 export function AiLayersPanel({
   withSession,
@@ -67,7 +67,7 @@ export function AiLayersPanel({
     setBusy("make");
     let reservation: Reservation;
     try {
-      reservation = await reserve(n); // 402 when there are not enough credits: nothing is made
+      reservation = await reserve(1); // one AI picture for all the layers; 402 when there are not enough credits
     } catch (e) {
       toast.error(errorText(e));
       setBusy(null);
@@ -122,8 +122,9 @@ export function AiLayersPanel({
     <div className="flex h-full flex-col">
       <div className="flex-1 space-y-4 overflow-y-auto p-4">
         <p className="text-sm text-muted">
-          The AI splits your design object by object and redraws each part as clean, closed outlines in its own colour, with
-          no fill. The background colour is one separate layer.
+          The AI traces your design as clean, closed outlines with no fill, and it is cut into one layer per part by the
+          colours of your photo, so every outline sits in the right layer and all layers line up. The background colour is
+          one separate layer.
         </p>
 
         <div>
@@ -167,11 +168,12 @@ export function AiLayersPanel({
               ))}
             </ol>
             <p>
-              Makes <b>{n} AI pictures</b>, one for each layer: <b>{n * CREDIT_COST.final} credits</b>.{" "}
+              Makes <b>one AI picture</b> with thin, even outlines, cut into one layer per colour of your photo (every
+              colour, also small ones like white beads): <b>{CREDIT_COST.final} credits</b>.{" "}
               {left > 0 ? `You can do this ${left} more time${left === 1 ? "" : "s"} for this photo.` : "No more runs for this photo."}
             </p>
             <Button variant="primary" className="w-full" onClick={make} loading={busy === "make"} disabled={disabled || !!busy || left <= 0}>
-              <Layers className="h-4 w-4" /> {busy === "make" ? "Making the layers… (a few minutes)" : `Make ${n} layer${n === 1 ? "" : "s"}`}
+              <Layers className="h-4 w-4" /> {busy === "make" ? "Making the layers… (about a minute)" : `Make ${n} layer${n === 1 ? "" : "s"}`}
             </Button>
           </div>
         )}
@@ -199,7 +201,7 @@ export function AiLayersPanel({
             </Button>
             <p className="text-[11px] text-muted">
               The PSD has a white background, your photo as a hidden layer, the background colour, then one outline layer for
-              each part. Each layer is drawn separately, so edges can differ by a few pixels.
+              each part. All layers come from one drawing, so they line up exactly.
             </p>
           </>
         )}

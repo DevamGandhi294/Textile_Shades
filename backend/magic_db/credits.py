@@ -75,6 +75,8 @@ def storage_used_bytes(db: Session, account_id) -> int:
 
 
 def check_storage(db: Session, account_id, extra_bytes: int):
+    if not config.BILLING_CHECKS:
+        return
     plan = plan_of(db, account_id)
     limit = plan.storage_mb * 1024 * 1024
     if storage_used_bytes(db, account_id) + extra_bytes > limit:
@@ -115,10 +117,10 @@ def reserve(db: Session, account_id, action: str, user_id=None, design_id=None, 
     _lock(db, account_id)
     release_stale(db, account_id)
     plan = plan_of(db, account_id)
-    if action == "multi_colour_hd" and not plan.hd_allowed:
+    if config.BILLING_CHECKS and action == "multi_colour_hd" and not plan.hd_allowed:
         raise HTTPException(402, f"Multi-colour HD needs the Pro or Studio plan. You are on {plan.name}.")
     cost = config.CREDIT_COST[action] * max(1, count)
-    if cost > 0 and balance(db, account_id) < cost:
+    if config.BILLING_CHECKS and cost > 0 and balance(db, account_id) < cost:
         raise HTTPException(402, "Not enough credits. Buy extra credits or wait for your plan to renew.")
     text = label or config.CREDIT_LABEL.get(action, action)
     hold = CreditHold(id=uuid.uuid4(), account_id=account_id, user_id=user_id, design_id=design_id, action=action,

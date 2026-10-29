@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { errorText } from "@/lib/api/client";
 import { billingApi, chatsApi, designsApi, type NewVersion } from "@/lib/api/data";
-import { DEFAULT_SETTINGS, outlineApi, type OutlineSettings } from "@/lib/api/outline";
+import { DEFAULT_SETTINGS, outlineApi, type EditedPicture, type OutlineSettings } from "@/lib/api/outline";
 import { CREDIT_COST, type Design, type DesignVersion } from "@/lib/api/types";
 import { storableCopy } from "@/lib/image";
 import { takePendingUpload } from "@/lib/pending-upload";
@@ -218,8 +218,6 @@ export function Workspace({ designId }: { designId: string }) {
       setApplied(JSON.stringify(settings));
       setShownId(null);
       await billingApi.logFree(changeNote(JSON.parse(applied), settings) ?? "Settings", party.data?.name ?? null, d?.name ?? null);
-      if (pending.flip_h || pending.flip_v || pending.mirror_half || pending.height_cm || pending.fill_repeat)
-        toast.info("Mirror, flip, height and repeat-fill are saved but need backend work before they change the image.");
       toast.success(`${nextLabel("outline")} done. No AI credits used.`);
       refresh();
     } catch (e) {
@@ -306,10 +304,80 @@ export function Workspace({ designId }: { designId: string }) {
     }
   }
 
-  function paidPending(action: "watermark" | "resize_fill") {
-    toast.info(
-      `${action === "watermark" ? "Remove watermark" : "Fill with AI"} needs backend work: the endpoint is not built yet. No credits were used.`,
-    );
+  // ------------------------------------------------------------------ edit the result shown
+
+  /** Saves an edited picture as a new version made from the result shown, and shows it. */
+  async function saveEdit(from: DesignVersion, r: EditedPicture, label: string, note: string, credits = 0, dpi?: number | null) {
+    const v = await addResultVersion({
+      kind: from.kind === "outline" ? "outline" : "ai",
+      image_url: r.image,
+      label,
+      note,
+      width_px: r.width_px,
+      height_px: r.height_px,
+      dpi: dpi ?? from.dpi,
+      ...(dpi ? sizeMm(r.width_px, r.height_px, { ...settings, width_cm: 0, dpi }) : {}),
+      credits,
+      parent_id: from.id,
+    });
+    setShownId(v.id);
+    setView("result");
+    refresh();
+  }
+
+  /** Remove watermark and text (paid): the AI changes nothing else. */
+  async function removeWatermark() {
+    if (!shown) return toast.error("Make a result first: Generate, AI layers or Apply settings.");
+    setBusy("watermark");
+    let reservation: Awaited<ReturnType<typeof billingApi.reserve>> | null = null;
+    try {
+      reservation = await billingApi.reserve("watermark", 1, "Remove watermark", party.data?.name ?? null, d?.name ?? null);
+      const r = await outlineApi.removeWatermark(shown.id);
+      await reservation.settle(true);
+      await saveEdit(shown, r, "Watermark removed", [r.model, `${reservation.cost} cr`].filter(Boolean).join(" · "), reservation.cost);
+      toast.success("Watermark and text removed.");
+    } catch (e) {
+      await reservation?.settle(false);
+      toast.error(`${errorText(e)}${reservation ? " No credits were used." : ""}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** Free edits in Python: flips and mirror, or a new size with the motif repeated. */
+  async function editResult(kind: "flip" | "size") {
+    if (!shown) return toast.error("Make a result first: Generate, AI layers or Apply settings.");
+    setBusy(kind === "flip" ? "edit-flip" : "edit-size");
+    try {
+      if (kind === "flip") {
+        const r = await outlineApi.transform(shown.id, { flip_h: pending.flip_h, flip_v: pending.flip_v, mirror_half: pending.mirror_half });
+        const what = [pending.mirror_half && "Mirrored half", pending.flip_h && "Flipped ↔", pending.flip_v && "Flipped ↕"].filter(Boolean).join(" + ");
+        await saveEdit(shown, r, what || "Edited", `From ${shown.label}`);
+        setPending({ ...pending, flip_h: false, flip_v: false, mirror_half: false }); // applied: not twice
+      } else {
+        const fill = settings.width_cm && pending.height_cm ? pending.fill : "stretch";
+        const r = await outlineApi.transform(shown.id, { width_cm: settings.width_cm, height_cm: pending.height_cm, fill, dpi: settings.dpi });
+        const size = [settings.width_cm && `${settings.width_cm} cm wide`, pending.height_cm && `${pending.height_cm} cm high`].filter(Boolean).join(" × ");
+        await saveEdit(shown, r, `Resized ${size}`, `${fill === "repeat" ? "Motif repeated" : fill === "fit" ? "Fitted" : "Stretched"} · ${settings.dpi} DPI`, 0, r.dpi);
+      }
+      toast.success("New version made. No credits used.");
+    } catch (e) {
+      toast.error(errorText(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteVersion(v: DesignVersion) {
+    if (!window.confirm(`Delete "${v.label}"? The image and its saved layers are removed. This cannot be undone.`)) return;
+    try {
+      await designsApi.removeVersion(designId, v.id);
+      setShownId(null);
+      toast.success(`${v.label} deleted.`);
+      refresh();
+    } catch (e) {
+      toast.error(errorText(e));
+    }
   }
 
   async function makeCurrent(v: DesignVersion) {
@@ -369,6 +437,7 @@ export function Workspace({ designId }: { designId: string }) {
             hasPerfect={results.some((v) => v.kind === "ai")}
             hasLayers={!!layerImg}
             hasAiLayers={!!aiImg}
+            layersVersionId={shown?.layer_count ? shown.id : null}
             fallbackImage={shown?.image_url}
             fallbackName={d.name}
           />
@@ -408,6 +477,7 @@ export function Workspace({ designId }: { designId: string }) {
             busy={busy === "generate"}
             disabled={!raw || offline}
             disabledReason={!raw ? "Upload a raw image first" : "Image server offline"}
+            loading={chats.isLoading}
           />
         </aside>
 
@@ -446,6 +516,11 @@ export function Workspace({ designId }: { designId: string }) {
                         Make current
                       </Button>
                     )}
+                    {shown && (
+                      <Button size="sm" variant="danger" onClick={() => deleteVersion(shown)} title={`Delete ${shown.label}`}>
+                        Delete
+                      </Button>
+                    )}
                   </div>
                 )}
               </div>
@@ -455,7 +530,13 @@ export function Workspace({ designId }: { designId: string }) {
                   <div className="absolute inset-0 z-10 grid place-items-center rounded-xl bg-white/60">
                     <span className="flex items-center gap-2 rounded-full bg-surface px-4 py-2 text-sm shadow">
                       <Loader2 className="h-4 w-4 animate-spin text-accent" />
-                      {busy === "upload" ? "Scanning the photo…" : "Applying settings… (up to a minute the first time)"}
+                      {busy === "upload"
+                        ? "Scanning the photo…"
+                        : busy === "watermark"
+                          ? "Removing the watermark… (up to a minute)"
+                          : busy.startsWith("edit-")
+                            ? "Making the new version…"
+                            : "Applying settings… (up to a minute the first time)"}
                     </span>
                   </div>
                 )}
@@ -507,8 +588,11 @@ export function Workspace({ designId }: { designId: string }) {
                 onApply={apply}
                 applying={busy === "apply"}
                 dirty={dirty}
-                onPaidAction={paidPending}
-                paidBusy={null}
+                onPaidAction={removeWatermark}
+                paidBusy={busy === "watermark" ? "watermark" : null}
+                onEdit={editResult}
+                editBusy={busy === "edit-flip" ? "flip" : busy === "edit-size" ? "size" : null}
+                hasResult={!!shown}
               />
             </TabsContent>
             <TabsContent value="layers" className="min-h-0 flex-1">
@@ -548,6 +632,7 @@ export function Workspace({ designId }: { designId: string }) {
                       credits: cost,
                     });
                     setShownId(v.id);
+                    if (session.sid) await outlineApi.aiSave(session.sid, v.id); // every layer, for the PSD later
                     refresh();
                   } catch (e) {
                     toast.error(`The AI layers were made but could not be saved to the design: ${errorText(e)}`);

@@ -1,6 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { ArrowRight } from "lucide-react";
 import Link from "next/link";
 import { use, useState } from "react";
@@ -8,10 +9,11 @@ import { PageHeader } from "@/components/app-shell";
 import { currentOf, rawOf } from "@/components/design-card";
 import { DownloadMenu } from "@/components/download-menu";
 import { ImageCompare } from "@/components/image-compare";
-import { Card, ErrorBox, Skeleton, buttonVariants } from "@/components/ui/primitives";
+import { Button, Card, ErrorBox, Skeleton, buttonVariants } from "@/components/ui/primitives";
+import { errorText } from "@/lib/api/client";
 import { designsApi } from "@/lib/api/data";
 import type { DesignVersion } from "@/lib/api/types";
-import { useDesign, useDesignChats, useParty } from "@/lib/queries";
+import { useDesign, useDesignChats, useParty, useRefreshAll } from "@/lib/queries";
 import { cn, longDate, shortDate, sizeLabel } from "@/lib/utils";
 
 /** Screen 4: design detail with the linked chain raw → scan → AI → outline v1 → v2. */
@@ -22,6 +24,7 @@ export default function DesignPage({ params }: { params: Promise<{ designId: str
   const chats = useDesignChats(designId);
   const session = useQuery({ queryKey: ["session", designId], queryFn: () => designsApi.getSession(designId) });
   const [picked, setPicked] = useState<string | null>(null);
+  const refresh = useRefreshAll();
 
   if (design.isLoading) return <div className="p-6"><Skeleton className="h-80" /></div>;
   if (design.error) return <div className="p-6"><ErrorBox error={design.error} /></div>;
@@ -30,6 +33,18 @@ export default function DesignPage({ params }: { params: Promise<{ designId: str
   const cur = currentOf(d);
   const shown = d.versions.find((v) => v.id === picked) ?? cur;
   const versionOf = (id: string | null) => d.versions.find((v) => v.id === id);
+
+  async function deleteShown() {
+    if (!shown || !window.confirm(`Delete "${shown.label}"? The image and its saved layers are removed. This cannot be undone.`)) return;
+    try {
+      await designsApi.removeVersion(d.id, shown.id);
+      setPicked(null);
+      toast.success(`${shown.label} deleted.`);
+      refresh();
+    } catch (e) {
+      toast.error(errorText(e));
+    }
+  }
 
   return (
     <div>
@@ -47,6 +62,7 @@ export default function DesignPage({ params }: { params: Promise<{ designId: str
             <DownloadMenu
               sid={session.data ?? null}
               designId={d.id}
+              layersVersionId={shown?.layer_count ? shown.id : null}
               fallbackImage={cur?.image_url}
               fallbackName={d.name}
             />
@@ -76,11 +92,23 @@ export default function DesignPage({ params }: { params: Promise<{ designId: str
           <Card className="p-5">
             <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
               <h2 className="font-semibold">Raw vs {shown?.label ?? "outline"}</h2>
-              <p className="text-sm text-muted">
-                {[sizeLabel(shown?.width_mm, shown?.height_mm), shown?.dpi && `${shown.dpi} DPI`, shown?.closed_boxes != null && `${shown.closed_boxes} closed boxes`]
-                  .filter(Boolean)
-                  .join(" · ")}
-              </p>
+              <div className="flex items-center gap-3">
+                <p className="text-sm text-muted">
+                  {[
+                    sizeLabel(shown?.width_mm, shown?.height_mm),
+                    shown?.dpi && `${shown.dpi} DPI`,
+                    shown?.closed_boxes != null && `${shown.closed_boxes} closed boxes`,
+                    shown?.layer_count && `${shown.layer_count} layers saved`,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </p>
+                {shown && (
+                  <Button size="sm" variant="danger" onClick={deleteShown}>
+                    Delete this image
+                  </Button>
+                )}
+              </div>
             </div>
             {raw && shown && shown.id !== raw.id ? (
               <ImageCompare before={raw.image_url} after={shown.image_url} beforeLabel="Raw" afterLabel={shown.label} className="aspect-[4/3]" />
@@ -96,6 +124,7 @@ export default function DesignPage({ params }: { params: Promise<{ designId: str
             <Card className="p-5">
               <h2 className="mb-3 font-semibold">Chats for this design</h2>
               <div className="space-y-4">
+                {chats.isLoading && [0, 1].map((i) => <Skeleton key={i} className="h-12" />)}
                 {chats.data?.map((c) => {
                   const first = c.messages.find((m) => m.role === "user");
                   return (

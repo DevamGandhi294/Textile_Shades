@@ -8,7 +8,6 @@ import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { designsApi } from "@/lib/api/data";
 import type { Party } from "@/lib/api/types";
-import { demoImage } from "@/lib/mock/images";
 import { useChats, useDesigns, useParties, useParty, useRefreshAll } from "@/lib/queries";
 import { cn, fileToDataUrl, shortAgo } from "@/lib/utils";
 import { ChatListItem } from "./chat-list";
@@ -21,7 +20,6 @@ import {
   Empty,
   ErrorBox,
   Input,
-  PendingTag,
   Skeleton,
   Tabs,
   TabsContent,
@@ -30,6 +28,8 @@ import {
 } from "./ui/primitives";
 
 /** Screen 3: party list with search, and the selected party's profile. */
+
+const MAX_IMPORT_MB = 20; // MAX_IMAGE_MB in backend/magic_db/config.py
 export function PartiesView({ partyId }: { partyId?: string }) {
   const router = useRouter();
   const [q, setQ] = useState("");
@@ -139,6 +139,8 @@ function PartyProfile({ partyId }: { partyId: string }) {
   // Import designs: every chosen image becomes a design with its raw version.
   const importDesigns = useMutation({
     mutationFn: async (files: File[]) => {
+      const big = files.find((f) => f.size > MAX_IMPORT_MB * 1024 * 1024);
+      if (big) throw new Error(`${big.name} is larger than ${MAX_IMPORT_MB} MB. Nothing was imported.`);
       for (const f of files) {
         const d = await designsApi.create({ party_id: partyId, name: f.name.replace(/\.[^.]+$/, "") });
         await designsApi.addVersion(d.id, {
@@ -146,7 +148,7 @@ function PartyProfile({ partyId }: { partyId: string }) {
           kind: "raw",
           label: "Raw",
           note: "Imported",
-          image_url: f.size < 3_000_000 ? await fileToDataUrl(f) : demoImage("floral", "raw"),
+          image_url: await fileToDataUrl(f), // the real file, always
           width_px: null,
           height_px: null,
           dpi: null,
@@ -217,12 +219,11 @@ function PartyProfile({ partyId }: { partyId: string }) {
         <Button onClick={() => importRef.current?.click()} loading={importDesigns.isPending}>
           <FileUp className="h-4 w-4" /> Import designs
         </Button>
-        <PendingTag />
       </div>
 
       <Tabs defaultValue="designs" className="mt-6">
         <TabsList>
-          <TabsTrigger value="designs">Designs (raw + outline)</TabsTrigger>
+          <TabsTrigger value="designs">Designs (raw + result)</TabsTrigger>
           <TabsTrigger value="chats">Chats ({p.chat_count})</TabsTrigger>
           <TabsTrigger value="raw">Raw images only</TabsTrigger>
         </TabsList>
@@ -259,6 +260,11 @@ function PartyProfile({ partyId }: { partyId: string }) {
             , filtered by this party.
           </p>
           <div className="divide-y divide-line overflow-hidden rounded-[var(--radius-card)] border border-line bg-surface">
+            {chats.isLoading && (
+              <div className="space-y-2 p-3">
+                {[0, 1, 2].map((i) => <Skeleton key={i} className="h-14" />)}
+              </div>
+            )}
             {chats.data?.map((c) => <ChatListItem key={c.id} chat={c} href={`/chats?party=${p.id}&chat=${c.id}`} />)}
             {chats.data?.length === 0 && <p className="p-4 text-sm text-muted">No chats yet.</p>}
           </div>

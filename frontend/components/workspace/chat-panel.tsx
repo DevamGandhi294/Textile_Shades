@@ -6,7 +6,7 @@ import { MAX_CHAT_CHARS } from "@/lib/api/outline";
 import { CREDIT_COST, type Chat, type DesignVersion } from "@/lib/api/types";
 import { cn } from "@/lib/utils";
 import { MessageBubble } from "../chat-list";
-import { Button, Select, Textarea } from "../ui/primitives";
+import { Button, Select, Textarea, Skeleton } from "../ui/primitives";
 
 export function ChatPanel({
   chats,
@@ -17,6 +17,7 @@ export function ChatPanel({
   busy,
   disabled,
   disabledReason,
+  loading,
 }: {
   chats: Chat[];
   chatId: string | null;
@@ -26,6 +27,7 @@ export function ChatPanel({
   busy: boolean;
   disabled?: boolean;
   disabledReason?: string;
+  loading?: boolean; // the chats are still loading
 }) {
   const [text, setText] = useState("");
   const end = useRef<HTMLDivElement>(null);
@@ -63,7 +65,14 @@ export function ChatPanel({
       </div>
 
       <div className="flex-1 space-y-4 overflow-y-auto px-3 py-4">
-        {!chat?.messages.length && (
+        {loading && (
+          <div className="space-y-3">
+            <Skeleton className="ml-auto h-10 w-3/4" />
+            <Skeleton className="h-16 w-4/5" />
+            <Skeleton className="ml-auto h-10 w-2/3" />
+          </div>
+        )}
+        {!loading && !chat?.messages.length && (
           <div className="rounded-xl bg-canvas p-4 text-sm text-muted">
             <p className="font-medium text-ink">Ask for a change in your own words</p>
             <p className="mt-1">“Clean this sketch, keep my lines close”, “make the lines thinner”, “close the small gaps”.</p>

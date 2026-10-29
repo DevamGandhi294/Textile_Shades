@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .. import credits, summaries
+from .. import config, credits, summaries
 from ..auth import Current, current
 from ..db import get_db
 from ..models import DesignVersion, Party, PartyReference
@@ -71,7 +71,7 @@ def get_party(party_id: str, cur: Current = Depends(current), db: Session = Depe
 @router.post("/parties")
 def create_party(body: PartyIn, cur: Current = Depends(current), db: Session = Depends(get_db)):
     plan = credits.plan_of(db, cur.account_id)
-    if plan.max_parties is not None:
+    if config.BILLING_CHECKS and plan.max_parties is not None:
         n = db.scalar(select(func.count()).select_from(Party)
                       .where(Party.account_id == cur.account_id, Party.archived.is_(False)))
         if n >= plan.max_parties:

@@ -1,7 +1,9 @@
 """Login (mobile number + password, or phone OTP), registration helpers, login sessions,
 and the `current` dependency every route uses."""
+import base64
 import hashlib
 import hmac
+import json
 import logging
 import re
 import secrets
@@ -211,6 +213,41 @@ def end_session(db: Session, token: str):
     s = db.scalar(select(LoginSession).where(LoginSession.token_hash == _hash("session", token)))
     if s:
         db.delete(s)
+
+
+# ------------------------------------------------------------------ Google login
+
+def verify_google(credential: str) -> dict:
+    """Check the ID token from the Google button (signature, expiry, our client id, verified email).
+    Returns {sub, email, name}."""
+    if not config.GOOGLE_CLIENT_ID:
+        raise HTTPException(503, "Google login is not set up on this server.")
+    from google.auth.transport import requests as google_requests
+    from google.oauth2 import id_token
+    try:
+        info = id_token.verify_oauth2_token(credential, google_requests.Request(), config.GOOGLE_CLIENT_ID)
+    except ValueError:
+        raise HTTPException(401, "Google login failed. Please try again.")
+    if not info.get("email") or not info.get("email_verified"):
+        raise HTTPException(401, "Your Google account has no verified email.")
+    return {"sub": info["sub"], "email": info["email"].strip().lower(), "name": (info.get("name") or "").strip()}
+
+
+def signup_ticket(google: dict) -> str:
+    """A short-lived, signed note of who Google said this is, for the second signup step (shop details)."""
+    body = json.dumps({**google, "exp": int(now().timestamp()) + config.GOOGLE_SIGNUP_MINUTES * 60}).encode()
+    data = base64.urlsafe_b64encode(body).decode().rstrip("=")
+    return f"{data}.{_hash('google-signup', data)}"
+
+
+def read_signup_ticket(ticket: str) -> dict:
+    data, _, sig = (ticket or "").partition(".")
+    if not data or not hmac.compare_digest(sig, _hash("google-signup", data)):
+        raise HTTPException(401, "Please sign in with Google again.")
+    google = json.loads(base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)))
+    if google.get("exp", 0) < now().timestamp():
+        raise HTTPException(401, "That took too long. Please sign in with Google again.")
+    return google
 
 
 # ------------------------------------------------------------------ who is calling

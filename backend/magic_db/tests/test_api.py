@@ -246,3 +246,78 @@ def test_api_token(client, monkeypatch):
     monkeypatch.setattr(config, "API_TOKEN", "abc")
     assert client.get("/api/plans").status_code == 401
     assert client.get("/api/plans", headers={"Authorization": "Bearer abc"}).status_code == 200
+
+
+def test_invite_link_logs_in_once_and_the_owner_sets_the_password(client):
+    from magic_db import config
+    owner_phone, designer_phone = phone(), phone()
+    h = login(client, owner_phone)
+    config.BILLING_CHECKS = False                     # testing mode: the free trial's one seat is not enforced
+    try:
+        r = client.post("/api/team/invite", json={"phone": designer_phone, "full_name": "Asha",
+                                                  "password": "owner-set-1"}, headers=h).json()
+    finally:
+        config.BILLING_CHECKS = True
+    assert r["ok"] and "temp_password" not in r and r["invite_path"] == f"/join?code={r['invite_code']}"
+    client.cookies.clear()
+    code = r["invite_code"].lower().replace("-", " ")            # typed by hand: case and spaces do not matter
+    info = client.post("/api/auth/invite/check", json={"code": code}).json()
+    assert info["full_name"] == "Asha" and info["phone"].endswith(designer_phone[-4:]) and "*" in info["phone"]
+    d = session_of(client.post("/api/auth/invite/accept", json={"code": code}))
+    client.cookies.clear()
+    assert client.get("/api/me", headers=d).json()["role"] == "designer"
+    assert client.post("/api/auth/invite/accept", json={"code": code}).status_code == 404, "the link works once"
+    assert client.post("/api/auth/login", json={"phone": designer_phone, "password": "owner-set-1"}).status_code == 200
+    client.cookies.clear()
+    uid = client.get("/api/me", headers=d).json()["user"]["id"]
+    new = client.post(f"/api/team/{uid}/invite-link", headers=h).json()
+    assert new["invite_code"] != r["invite_code"]
+    assert client.post(f"/api/team/{uid}/invite-link", headers=d).status_code == 403, "only the owner"
+    client.delete(f"/api/team/{uid}", headers=h)
+    assert client.post("/api/auth/invite/accept", json={"code": new["invite_code"]}).status_code == 404, \
+        "a removed designer's link stops working"
+
+
+def test_billing_checks_can_be_switched_off_for_testing(client):
+    from magic_db import config
+    h = login(client, phone())
+    config.BILLING_CHECKS = False
+    try:
+        r = client.post("/api/credits/reserve", json={"action": "multi_colour", "count": 20}, headers=h)
+        r = client.post("/api/credits/reserve", json={"action": "multi_colour", "count": 20}, headers=h)
+        assert r.status_code == 200 and r.json()["balance"] == 100 - 120, "no 402; usage is still recorded"
+    finally:
+        config.BILLING_CHECKS = True
+    assert client.post("/api/credits/reserve", json={"action": "multi_colour"}, headers=h).status_code == 402
+
+
+def test_google_login_new_person_gives_shop_details_then_logs_in_directly(client, monkeypatch):
+    from magic_db import auth, config
+    sub, email = f"g-{phone()}", f"{phone()}@gmail.com"
+    monkeypatch.setattr(config, "GOOGLE_CLIENT_ID", "test-client-id")
+    monkeypatch.setattr(auth, "verify_google", lambda credential: {"sub": sub, "email": email, "name": "Riya Shah"})
+    assert client.get("/api/auth/google/config").json() == {"enabled": True, "client_id": "test-client-id"}
+
+    first = client.post("/api/auth/google", json={"credential": "x"}).json()      # step 1: a new person
+    assert first["logged_in"] is False and first["email"] == email and first["full_name"] == "Riya Shah"
+    assert client.post("/api/auth/google/complete", json={"signup_token": first["signup_token"] + "x",
+                                                          "phone": phone(), "company_name": "S"}).status_code == 401
+    mobile = phone()
+    me = client.post("/api/auth/google/complete", json={"signup_token": first["signup_token"], "phone": mobile,
+                                                        "company_name": "Riya Prints", "city": "Surat"})
+    assert me.status_code == 201 and me.json()["role"] == "owner" and me.json()["account"]["business_name"] == "Riya Prints"
+    assert client.get("/api/billing").json()["credits"]["balance"] == 100                  # free trial, logged in
+    client.cookies.clear()
+
+    again = client.post("/api/auth/google", json={"credential": "x"})                  # next time: straight in
+    assert again.json()["logged_in"] is True and again.json()["me"]["user"]["phone"].endswith(mobile[-4:])
+    client.cookies.clear()
+    assert client.post("/api/auth/google/complete", json={"signup_token": first["signup_token"], "phone": phone(),
+                                                          "company_name": "Again"}).status_code == 409
+
+
+def test_google_login_is_off_without_a_client_id(client, monkeypatch):
+    from magic_db import config
+    monkeypatch.setattr(config, "GOOGLE_CLIENT_ID", "")
+    assert client.get("/api/auth/google/config").json()["enabled"] is False
+    assert client.post("/api/auth/google", json={"credential": "x"}).status_code == 503

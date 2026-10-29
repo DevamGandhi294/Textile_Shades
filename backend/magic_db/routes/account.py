@@ -4,6 +4,7 @@ The login lives in an httpOnly cookie (mo_session, path=/). It is never put in a
 API clients that are not browsers may send the same value in an X-Session-Token header.
 """
 import secrets
+from datetime import timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
@@ -13,9 +14,9 @@ from sqlalchemy.orm import Session
 from .. import auth, config, credits
 from ..auth import Current, current
 from ..db import get_db
-from ..models import Account, AccountMember, LoginSession, User
-from ..schemas import (InviteIn, LoginIn, MeIn, OtpSendIn, OtpVerifyIn, PasswordChangeIn, PasswordResetIn,
-                       RegisterIn)
+from ..models import Account, AccountMember, LoginSession, TeamInvite, User
+from ..schemas import (GoogleCompleteIn, GoogleIn, InviteCodeIn, InviteIn, LoginIn, MeIn, OtpSendIn, OtpVerifyIn,
+                       PasswordChangeIn, PasswordResetIn, RegisterIn)
 from ..serialize import account_out, as_uuid, iso, user_out
 
 router = APIRouter()
@@ -66,6 +67,54 @@ def register(body: RegisterIn, response: Response, db: Session = Depends(get_db)
 @router.post("/auth/login")
 def login(body: LoginIn, response: Response, db: Session = Depends(get_db)):
     member = auth.check_password_login(db, auth.normalise_phone(body.phone), body.password)
+    return _log_in(db, response, member)
+
+
+@router.get("/auth/google/config")
+def google_config():
+    """Is Google login on, and with which client id (the website shows the Google button only when it is)."""
+    return {"enabled": bool(config.GOOGLE_CLIENT_ID), "client_id": config.GOOGLE_CLIENT_ID or None}
+
+
+@router.post("/auth/google")
+def google_login(body: GoogleIn, response: Response, db: Session = Depends(get_db)):
+    """Step 1 of Google login. A known person (their Google account, or the same verified email) is logged in
+    at once: {"logged_in": true, "me": ...}. A new person gets {"logged_in": false, "signup_token", "email",
+    "full_name"}: send it with the shop details to POST /auth/google/complete."""
+    g = auth.verify_google(body.credential)
+    user = db.scalar(select(User).where(User.google_sub == g["sub"]))
+    if user is None:
+        user = db.scalar(select(User).where(func.lower(User.email) == g["email"]))
+        if user is not None and user.google_sub is None:
+            user.google_sub = g["sub"]                          # same verified email: link Google to it
+    if user is not None:
+        member = auth.membership(db, user)
+        if member is None:
+            raise HTTPException(403, "This account is not part of any shop any more.")
+        return {"logged_in": True, "me": _log_in(db, response, member)}
+    return {"logged_in": False, "signup_token": auth.signup_ticket(g), "email": g["email"], "full_name": g["name"]}
+
+
+@router.post("/auth/google/complete", status_code=201)
+def google_complete(body: GoogleCompleteIn, response: Response, db: Session = Depends(get_db)):
+    """Step 2 of Google login for a new person: the shop name and mobile number. Starts the free trial and logs
+    in. No password is needed (they log in with Google); they can set one later."""
+    g = auth.read_signup_ticket(body.signup_token)
+    phone = auth.normalise_phone(body.phone)
+    if db.scalar(select(User.id).where(User.phone == phone)):
+        raise HTTPException(409, "This mobile number is already registered. Log in with your mobile number and password.")
+    if db.scalar(select(User.id).where((User.google_sub == g["sub"]) | (func.lower(User.email) == g["email"]))):
+        raise HTTPException(409, "This Google account is already registered. Please sign in with Google again.")
+    user = User(phone=phone, email=g["email"], google_sub=g["sub"],
+                full_name=(body.owner_name or g["name"] or "").strip() or None)
+    account = Account(business_name=body.company_name.strip(), email=g["email"], gstin=auth.clean_gstin(body.gstin),
+                      city=(body.city or "").strip() or None)
+    db.add_all([user, account])
+    db.flush()
+    member = AccountMember(account_id=account.id, user_id=user.id, role="owner")
+    db.add(member)
+    db.flush()
+    credits.start_trial(db, account.id, user.id)
     return _log_in(db, response, member)
 
 
@@ -192,15 +241,77 @@ def team(cur: Current = Depends(current), db: Session = Depends(get_db)):
     return [{"user": user_out(m.user), "role": m.role, "joined_at": iso(m.joined_at)} for m in rows]
 
 
+# ------------------------------------------------------------------ one-time login links for designers
+
+CODE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"          # no 0/O or 1/I: easy to read out and type
+
+
+def _clean_code(raw: str) -> str:
+    return "".join(ch for ch in (raw or "").upper() if ch in CODE_LETTERS)
+
+
+def _new_invite(db: Session, cur: Current, user_id) -> dict:
+    """A new one-time login link for this designer; earlier unused links of the same designer stop working."""
+    db.query(TeamInvite).filter(TeamInvite.account_id == cur.account_id, TeamInvite.user_id == user_id,
+                                TeamInvite.used_at.is_(None)).delete()
+    plain = "".join(secrets.choice(CODE_LETTERS) for _ in range(10))
+    expires = auth.now() + timedelta(days=config.INVITE_DAYS)
+    db.add(TeamInvite(account_id=cur.account_id, user_id=user_id, code_hash=auth._hash("invite", plain),
+                      expires_at=expires, created_by=cur.user_id))
+    code = f"{plain[:5]}-{plain[5:]}"
+    return {"invite_code": code, "invite_path": f"/join?code={code}", "invite_expires_at": iso(expires)}
+
+
+def _open_invite(db: Session, code: str) -> TeamInvite:
+    inv = db.scalar(select(TeamInvite).where(TeamInvite.code_hash == auth._hash("invite", _clean_code(code))))
+    if inv is None or inv.used_at is not None or inv.expires_at <= auth.now():
+        raise HTTPException(404, "This login link is used or expired. Ask the shop owner for a new one.")
+    if db.get(AccountMember, (inv.account_id, inv.user_id)) is None:
+        raise HTTPException(404, "This designer was removed from the shop.")
+    return inv
+
+
+@router.post("/auth/invite/check")
+def invite_check(body: InviteCodeIn, db: Session = Depends(get_db)):
+    """Who a login link is for (shown before joining). Does not use the link."""
+    inv = _open_invite(db, body.code)
+    user, account = db.get(User, inv.user_id), db.get(Account, inv.account_id)
+    return {"business_name": account.business_name, "full_name": user.full_name,
+            "phone": user.phone[:3] + "*" * (len(user.phone) - 7) + user.phone[-4:],     # +91******2345
+            "expires_at": iso(inv.expires_at)}
+
+
+@router.post("/auth/invite/accept")
+def invite_accept(body: InviteCodeIn, response: Response, db: Session = Depends(get_db)):
+    """Log the designer in with a login link. The link works ONCE: after that it is refused, and the designer
+    logs in with their mobile number and the password the owner set."""
+    inv = _open_invite(db, body.code)
+    inv.used_at = auth.now()
+    member = db.get(AccountMember, (inv.account_id, inv.user_id))
+    return _log_in(db, response, member)
+
+
+@router.post("/team/{user_id}/invite-link")
+def invite_link(user_id: str, cur: Current = Depends(current), db: Session = Depends(get_db)):
+    """A new one-time login link for a designer of this shop (the old one stops working)."""
+    cur.require_owner()
+    m = db.get(AccountMember, (cur.account_id, as_uuid(user_id, "member")))
+    if m is None or m.role != "designer":
+        raise HTTPException(404, "Designer not found.")
+    out = {"ok": True, **_new_invite(db, cur, m.user_id)}
+    db.commit()
+    return out
+
+
 @router.post("/team/invite")
 def invite(body: InviteIn, cur: Current = Depends(current), db: Session = Depends(get_db)):
-    """Add a designer by mobile number. If no password is given, a temporary one is made and returned
-    once, for the owner to share (for example on WhatsApp). The designer can change it after logging in."""
+    """Add a designer by mobile number, with the password the owner chooses (if none is given, a temporary
+    one is made and returned once). Also returns a one-time login link to share, for example on WhatsApp."""
     cur.require_owner()
     plan = credits.plan_of(db, cur.account_id)
     seats = db.scalar(select(func.count()).select_from(AccountMember)
                       .where(AccountMember.account_id == cur.account_id))
-    if seats >= plan.seats:
+    if config.BILLING_CHECKS and seats >= plan.seats:
         raise HTTPException(402, f"All {plan.seats} seat{'s' if plan.seats != 1 else ''} of {plan.name} are used. "
                                  "Upgrade to add more designers.")
     phone = auth.normalise_phone(body.phone)
@@ -215,8 +326,9 @@ def invite(body: InviteIn, cur: Current = Depends(current), db: Session = Depend
     elif db.scalar(select(AccountMember).where(AccountMember.user_id == user.id)):
         raise HTTPException(409, "This mobile number already belongs to a shop.")
     db.add(AccountMember(account_id=cur.account_id, user_id=user.id, role="designer"))
+    db.flush()
+    out = {"ok": True, **_new_invite(db, cur, user.id)}
     db.commit()
-    out = {"ok": True}
     if temp and not body.password:
         out["temp_password"] = temp
     return out

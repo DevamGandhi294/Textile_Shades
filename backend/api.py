@@ -13,8 +13,12 @@ uploaded image; the Session is kept in memory so a settings change only re-runs 
     POST /api/sessions/{id}/chat        {message}  -> ask for a change in words (image edits only)
     POST /api/sessions/{id}/layers      {colors, merge, hidden} -> colour layers read from the photo (free, offline)
     POST /api/sessions/{id}/ai-analyse  {machine} -> AI layers step 1: what the design is and which layers (cheap)
-    POST /api/sessions/{id}/ai-layers   AI layers steps 2-3: one image call per layer (paid; see README)
+    POST /api/sessions/{id}/ai-layers   AI layers steps 2-3: one image call, cut into layers (paid; see README)
     GET  /api/sessions/{id}/ai-layers   the AI layers made so far, with a preview (free)
+    POST /api/sessions/{id}/ai-layers/save  {version_id} -> keep every AI layer with a saved design version (login)
+    GET  /api/versions/{id}/layers.psd  the PSD of a saved version's layers, any time later (login)
+    POST /api/versions/{id}/transform   flip, mirror half, size in cm, fill by repeating (free, Python; login)
+    POST /api/versions/{id}/remove-watermark  the AI removes watermarks and text only (paid; login)
     GET  /api/sessions/{id}/download    ?fmt=zip|png|pdf|svg|eps|dxf|tiff|bmp|perfect|layers-svg|layers-zip|layers-psd|perfect-psd|ai-layers-psd
     GET  /api/health
 
@@ -43,9 +47,10 @@ from typing import Annotated, Literal, Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 
@@ -58,6 +63,13 @@ import chat
 import layer_pipeline
 import magic_db
 import perfect
+from magic_db import credits as db_credits, storage as db_storage
+from magic_db.auth import Current, current
+from magic_db.db import get_db
+from magic_db.models import DesignVersion, VersionLayer
+from magic_db.serialize import get_owned
+from sqlalchemy import select
+from sqlalchemy.orm import Session as DbSession
 
 HERE = Path(__file__).resolve().parent
 CHAT_MAX_CHARS = 300                              # longest chat message (also checked by the website)
@@ -307,6 +319,7 @@ TAGS = [
     {"name": "Image: AI outline and chat", "description": "Make border perfect and Chat to improve it (paid OpenAI calls)."},
     {"name": "Image: colour layers", "description": "Colour layers read from the photo (free, offline)."},
     {"name": "Image: AI layers", "description": "Check the design, then one AI outline layer per part (paid)."},
+    {"name": "Image: edit a result", "description": "Flip, mirror, resize and fill (free), or remove a watermark (paid)."},
     {"name": "Account and team", "description": "Register, login, password, OTP, profile and team (magic_db)."},
     {"name": "Parties", "description": "Customers (parties) and their preferences (magic_db)."},
     {"name": "Designs", "description": "Designs, their versions and image sessions (magic_db)."},
@@ -608,9 +621,9 @@ def ai_analyse(sid: str, body: AnalyseIn, authorization: Optional[str] = Header(
 
 @app.post("/api/sessions/{sid}/ai-layers", tags=["Image: AI layers"])
 def make_ai_layers(sid: str, authorization: Optional[str] = Header(None)):
-    """AI layers, steps 2 to 3: one image call per layer of the plan from /ai-analyse, using the model chosen for
-    the plan (complete designs and incomplete ones use different models). The calls count in the hourly image limit,
-    and the number of runs per photo is limited (AI_LAYERS_MAX_RUNS_PER_SESSION). Needs API_TOKEN (if set)."""
+    """AI layers, steps 2 to 3: ONE image call traces the whole design (with the model chosen for the plan), and
+    the outlines are cut into the plan's layers by the photo's colours, so the layers always line up. It counts once
+    in the hourly image limit; the runs per photo are limited (AI_LAYERS_MAX_RUNS_PER_SESSION). Needs API_TOKEN."""
     _require_token(authorization)
     entry = _get(sid)
     limit = _env_int("AI_LAYERS_MAX_RUNS_PER_SESSION", 2)
@@ -621,47 +634,32 @@ def make_ai_layers(sid: str, authorization: Optional[str] = Header(None)):
             raise HTTPException(429, f"The AI layers can be made {limit} times per photo. Upload the photo again to try more.")
         entry.ai_runs += 1
         plan, path = dict(entry.ai_plan), entry.sess.path
-    n = len(plan["layers"])
-    stamps = []
-    for _ in range(n):                            # one hourly slot per image call; all or nothing
-        stamp = _reserve_hourly()
-        if stamp is None:
-            for taken in stamps:
-                _release_hourly(taken)
-            with entry.lock:
-                entry.ai_runs -= 1
-            raise HTTPException(429, "The AI layers have been used too often in the last hour. Please try again later.")
-        stamps.append(stamp)
-
+    stamp = _reserve_hourly()                    # one image call for all the layers
+    if stamp is None:
+        with entry.lock:
+            entry.ai_runs -= 1
+        raise HTTPException(429, "The AI layers have been used too often in the last hour. Please try again later.")
     try:
-        results = layer_pipeline.generate_all(load_rgb(path), plan)
+        made = layer_pipeline.generate_all(load_rgb(path), plan)
+    except layer_pipeline.PipelineError as e:
+        _release_hourly(stamp)                    # nothing was made: not paid, the run is not counted
+        with entry.lock:
+            entry.ai_runs -= 1
+        raise HTTPException(502, str(e))
     except Exception:
         log.exception("AI layers failed")
-        for taken in stamps:
-            _release_hourly(taken)
+        _release_hourly(stamp)
         with entry.lock:
             entry.ai_runs -= 1
         raise HTTPException(500, "Something went wrong while making the layers. Please try again.")
-
-    made = [r for r in results if r["rgba"] is not None]
-    failed = [r for r in results if r["rgba"] is None]
-    for _ in failed:
-        _release_hourly(stamps.pop())             # a layer that could not be made was not paid
-    for r in made:
-        _log_usage(sid, "ai-layer", {**r["meta"], "layer": r["name"], "prompt": r["prompt"]})
+    _log_usage(sid, "ai-layers", {**made["meta"], "layer": ", ".join(n for n, _ in made["layers"]),
+                                  "prompt": made["prompt"]})
     with entry.lock:
-        if not entry.folder.exists():              # the photo expired while the calls were running
+        if not entry.folder.exists():              # the photo expired while the call was running
             raise HTTPException(404, "This picture has expired. Please upload it again.")
-        if made:
-            h, w = made[0]["rgba"].shape[:2]      # the background colour is one solid layer at the bottom (free)
-            bg = ("Background colour", layer_pipeline.background_layer(plan, (w, h)))
-            entry.ai_layers = {"plan": plan, "layers": [bg] + [(r["name"], r["rgba"]) for r in made]}
-        else:
-            entry.ai_runs -= 1                    # nothing was made: the run is not counted
-    if failed:
-        names = ", ".join(r["name"] for r in failed)
-        kept = f" The other {len(made)} were kept." if made else ""
-        raise HTTPException(502, f"{len(failed)} of {n} layers could not be made ({names}): {failed[0]['error']}{kept}")
+        h, w = made["layers"][0][1].shape[:2]     # the background colour is one solid layer at the bottom (free)
+        bg = ("Background colour", layer_pipeline.background_layer(plan, (w, h)))
+        entry.ai_layers = {"plan": plan, "layers": [bg] + list(made["layers"])}
     return _ai_json(entry)
 
 
@@ -673,6 +671,209 @@ def get_ai_layers(sid: str, hidden: str = ""):
     off = {int(x) for x in hidden.split(",") if x.strip().isdigit()}
     with entry.lock:
         return _ai_json(entry, off)
+
+
+class SaveLayersIn(BaseModel):
+    version_id: str
+
+
+def _layer_colour(name, plan):
+    """The colour a layer was drawn in (shown as the layer's colour in the design's history)."""
+    if name == "Background colour":
+        return plan.get("background_color") or "#ffffff"
+    return next((l["border_color"] for l in plan["layers"] if l["name"] == name), layer_pipeline.LINE_BORDER_COLOUR)
+
+
+@app.post("/api/sessions/{sid}/ai-layers/save", tags=["Image: AI layers"])
+def save_ai_layers(sid: str, body: SaveLayersIn, cur: Current = Depends(current), db: DbSession = Depends(get_db)):
+    """Keep the AI layers made for this photo with a saved design version: one PNG per layer in storage and one
+    row per layer in version_layers. The image session lives for an hour; the saved layers stay, so the PSD can
+    be downloaded again later (GET /api/versions/{id}/layers.psd)."""
+    entry = _get(sid)
+    with entry.lock:
+        ai = entry.ai_layers
+        if ai is None:
+            raise HTTPException(404, "Make the AI layers first.")
+        plan, made = ai["plan"], list(ai["layers"])
+    v = get_owned(db, DesignVersion, body.version_id, cur.account_id, "image")
+    files = []
+    for pos, (name, rgba) in enumerate(made, start=1):
+        page = layer_pipeline._full_width(rgba, plan["mirror"])        # a mirrored design is saved whole
+        ok, png = cv2.imencode(".png", cv2.cvtColor(page, cv2.COLOR_RGBA2BGRA))
+        files.append((pos, name, png.tobytes()))
+    db_credits.check_storage(db, cur.account_id, sum(len(f[2]) for f in files))
+
+    base = v.storage_key.rsplit("/", 1)[0] + "/layers"                 # next to the version's own image
+    old = list(db.scalars(select(VersionLayer).where(VersionLayer.version_id == v.id)))
+    for row in old:
+        db.delete(row)
+    keys = []
+    for pos, name, png in files:
+        key = f"{base}/{pos:02d}.png"
+        db_storage.put(key, png, "image/png")
+        keys.append(key)
+        db.add(VersionLayer(account_id=cur.account_id, version_id=v.id, position=pos, name=name,
+                            color=_layer_colour(name, plan), visible=True, mask_key=key))
+    v.size_bytes = (v.size_bytes or 0) + sum(len(f[2]) for f in files)
+    db.commit()
+    db_storage.delete(*[r.mask_key for r in old if r.mask_key and r.mask_key not in keys])
+    return {"ok": True, "layers": len(files)}
+
+
+@app.get("/api/versions/{version_id}/layers.psd", tags=["Image: AI layers"])
+def saved_layers_psd(version_id: str, cur: Current = Depends(current), db: DbSession = Depends(get_db)):
+    """One PSD from a saved version's layers (no AI call, no image session needed): a white Background, the
+    design's raw photo as a hidden layer, then the layers bottom to top."""
+    v = get_owned(db, DesignVersion, version_id, cur.account_id, "image")
+    rows = list(db.scalars(select(VersionLayer).where(VersionLayer.version_id == v.id,
+                                                      VersionLayer.mask_key.is_not(None))
+                           .order_by(VersionLayer.position)))
+    if not rows:
+        raise HTTPException(404, "This image has no saved layers.")
+    pages = []
+    for r in rows:
+        img = cv2.imdecode(np.frombuffer(db_storage.read(r.mask_key), np.uint8), cv2.IMREAD_UNCHANGED)
+        if img is None or img.ndim != 3 or img.shape[2] != 4:
+            raise HTTPException(500, f"The saved layer '{r.name}' could not be read.")
+        pages.append((r.name, cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)))
+    raw = db.scalar(select(DesignVersion).where(DesignVersion.design_id == v.design_id, DesignVersion.kind == "raw",
+                                                DesignVersion.created_at <= v.created_at)
+                    .order_by(DesignVersion.created_at.desc()))
+    reference = None
+    if raw is not None:
+        ref = cv2.imdecode(np.frombuffer(db_storage.read(raw.storage_key), np.uint8), cv2.IMREAD_COLOR)
+        reference = cv2.cvtColor(ref, cv2.COLOR_BGR2RGB) if ref is not None else None
+    out = Path(tempfile.mkdtemp(prefix="layers_psd_"))
+    name = re.sub(r"[^\w-]+", "_", v.label or "ai_layers").strip("_") or "ai_layers"
+    path = out / f"{name}.psd"
+    try:
+        layer_pipeline.export_psd(path, pages, False, v.dpi or 300, reference=reference)
+    except layer_pipeline.PipelineError as e:
+        raise HTTPException(400, str(e))
+    return FileResponse(path, filename=path.name, media_type="image/vnd.adobe.photoshop",
+                        background=BackgroundTask(shutil.rmtree, out, ignore_errors=True))
+
+
+# ----------------------------------------------------------------- edit a saved result (any version)
+
+MAX_EDIT_PIXELS = 60_000_000                      # a resized picture larger than this is refused (memory)
+WATERMARK_PROMPT = """**Task: remove watermarks and text, change nothing else**
+
+Remove every watermark, logo, stamp, signature, label, design number and piece of text or lettering from this
+textile design image (for example a code like "LM-45258 B" in a black box).
+
+Rules:
+- Fill each removed area so it continues the surrounding design seamlessly: the same motifs, lines, colours and
+  background, as if nothing had been there.
+- Change NOTHING else: same layout, size, proportions, motifs, line thickness, colours, sharpness and style.
+  Do not redraw, clean up, recolour, add or improve anything.
+- If there is no watermark or text, return the image unchanged."""
+
+
+def _version_rgba(db, cur, version_id):
+    """A saved version's picture as RGBA, and its row."""
+    v = get_owned(db, DesignVersion, version_id, cur.account_id, "image")
+    img = cv2.imdecode(np.frombuffer(db_storage.read(v.storage_key), np.uint8), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise HTTPException(422, "This image cannot be edited (it is not a photo or PNG).")
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+    elif img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    return cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA), v
+
+
+def _png_data_url(rgba):
+    ok, png = cv2.imencode(".png", cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
+    return "data:image/png;base64," + base64.b64encode(png.tobytes()).decode("ascii")
+
+
+class TransformIn(BaseModel):
+    flip_h: bool = False
+    flip_v: bool = False
+    mirror_half: bool = False                     # the left half, mirrored onto the right half
+    width_cm: float = Field(0, ge=0, le=300)      # 0 = keep
+    height_cm: float = Field(0, ge=0, le=300)     # 0 = keep the shape
+    fill: Literal["repeat", "stretch", "fit"] = "repeat"
+    dpi: int = Field(300, ge=72, le=1200)
+
+
+def transform_rgba(rgba, t: TransformIn):
+    """The free edits, in this order: mirror half, flips, then the size. With both width and height, `fill` says
+    how the new shape is filled: repeat the motif (tile it), stretch it, or fit it in and leave the rest empty."""
+    if t.mirror_half:
+        half = rgba[:, : rgba.shape[1] // 2]
+        rgba = np.concatenate([half, half[:, ::-1]], axis=1)
+    if t.flip_h:
+        rgba = rgba[:, ::-1]
+    if t.flip_v:
+        rgba = rgba[::-1]
+    h, w = rgba.shape[:2]
+    if not (t.width_cm or t.height_cm):
+        return np.ascontiguousarray(rgba)
+    px = lambda cm: max(1, round(cm / 2.54 * t.dpi))
+    tw = px(t.width_cm) if t.width_cm else None
+    th = px(t.height_cm) if t.height_cm else None
+    if tw is None or th is None:                  # one side given: keep the shape
+        tw, th = (tw, round(h * tw / w)) if tw else (round(w * th / h), th)
+        mode = "stretch"
+    else:
+        mode = t.fill
+    if tw * th > MAX_EDIT_PIXELS:
+        raise HTTPException(422, f"That size is too large ({tw} x {th} pixels). Lower the DPI or the size.")
+    if mode == "stretch":
+        return cv2.resize(rgba, (tw, th), interpolation=cv2.INTER_AREA if tw * th < w * h else cv2.INTER_CUBIC)
+    scale = min(tw / w, th / h) if mode == "fit" else th / h          # repeat: one motif row is the new height
+    sw, sh = max(1, round(w * scale)), max(1, round(h * scale))
+    tile = cv2.resize(rgba, (sw, sh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+    if mode == "fit":
+        out = np.zeros((th, tw, 4), np.uint8)                           # transparent around it
+        y, x = (th - sh) // 2, (tw - sw) // 2
+        out[y:y + sh, x:x + sw] = tile
+        return out
+    reps_x, reps_y = -(-tw // sw), -(-th // sh)
+    return np.ascontiguousarray(np.tile(tile, (reps_y, reps_x, 1))[:th, :tw])
+
+
+@app.post("/api/versions/{version_id}/transform", tags=["Image: edit a result"])
+def transform_version(version_id: str, body: TransformIn, cur: Current = Depends(current),
+                      db: DbSession = Depends(get_db)):
+    """Free edits of a saved result, made in Python (no AI): flip, mirror half, a new size in cm, and fill the
+    new shape by repeating the motif. Returns the new picture; the website saves it as a new version."""
+    rgba, v = _version_rgba(db, cur, version_id)
+    out = transform_rgba(rgba, body)
+    h, w = out.shape[:2]
+    return {"image": _png_data_url(out), "width_px": int(w), "height_px": int(h),
+            "dpi": body.dpi if (body.width_cm or body.height_cm) else (v.dpi or None)}
+
+
+@app.post("/api/versions/{version_id}/remove-watermark", tags=["Image: edit a result"])
+def remove_watermark(version_id: str, cur: Current = Depends(current), db: DbSession = Depends(get_db),
+                     authorization: Optional[str] = Header(None)):
+    """The AI removes watermarks, logos and text from a saved result and changes nothing else (one paid image
+    call, WATERMARK_MODEL, default gpt-image-2.5-sunburst). Returns the new picture; the website saves it."""
+    _require_token(authorization)
+    rgba, v = _version_rgba(db, cur, version_id)
+    a = rgba[..., 3:4].astype(np.float32) / 255                      # transparent parts go on white paper
+    rgb = (rgba[..., :3].astype(np.float32) * a + 255 * (1 - a) + 0.5).astype(np.uint8)
+    stamp = _reserve_hourly()
+    if stamp is None:
+        raise HTTPException(429, "The AI has been used too often in the last hour. Please try again later.")
+    model = os.environ.get("WATERMARK_MODEL", "gpt-image-2.5-sunburst")
+    try:
+        raw, meta = perfect._edit(rgb, WATERMARK_PROMPT, model, {"output_format": "png"})
+    except perfect.PerfectError as e:
+        _release_hourly(stamp)
+        raise HTTPException(502, str(e))
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        _release_hourly(stamp)
+        raise HTTPException(502, "OpenAI returned an image that could not be read.")
+    h, w = rgba.shape[:2]
+    out = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), (w, h), interpolation=cv2.INTER_CUBIC)
+    _log_usage(f"version:{version_id}", "remove-watermark", {**meta, "prompt": WATERMARK_PROMPT})
+    return {"image": _png_data_url(np.dstack([out, np.full((h, w), 255, np.uint8)])), "width_px": w, "height_px": h,
+            "model": meta.get("model"), "quality": meta.get("quality")}
 
 
 def _download_ai_layers(entry):

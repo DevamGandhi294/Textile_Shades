@@ -1,13 +1,14 @@
 "use client";
 
 import { useMutation } from "@tanstack/react-query";
-import { FileText, Pencil, UserPlus, X } from "lucide-react";
+import { Copy, FileText, Link2, MessageCircle, Pencil, UserPlus, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { PageHeader } from "@/components/app-shell";
 import {
   Badge,
   Button,
+  buttonVariants,
   Card,
   Dialog,
   DialogContent,
@@ -282,14 +283,24 @@ function Team({ seats }: { seats?: number }) {
   const [open, setOpen] = useState(false);
   const [phone, setPhone] = useState("");
   const [name, setName] = useState("");
+  const [password, setPassword] = useState("");
+  const [share, setShare] = useState<InviteShare | null>(null);
   const invite = useMutation({
-    mutationFn: () => billingApi.invite(phone, name),
-    onSuccess: () => {
-      toast.success("Invite sent.");
-      setOpen(false);
+    mutationFn: () => billingApi.invite(phone, name, password),
+    onSuccess: (r) => {
+      setShare({ name: name.trim(), phone, password: r.temp_password ?? password, code: r.invite_code, path: r.invite_path, expires: r.invite_expires_at });
       setPhone("");
       setName("");
+      setPassword("");
       refresh();
+    },
+    onError: (e) => toast.error(e.message),
+  });
+  const link = useMutation({
+    mutationFn: (m: { id: string; name: string; phone: string }) => billingApi.inviteLink(m.id).then((r) => ({ r, m })),
+    onSuccess: ({ r, m }) => {
+      setShare({ name: m.name, phone: m.phone, password: null, code: r.invite_code, path: r.invite_path, expires: r.invite_expires_at });
+      setOpen(true);
     },
     onError: (e) => toast.error(e.message),
   });
@@ -298,16 +309,26 @@ function Team({ seats }: { seats?: number }) {
     onSuccess: () => refresh(),
   });
   const n = members.data?.length ?? 0;
+  const close = () => {
+    setOpen(false);
+    setShare(null);
+  };
   return (
     <Card className="p-5">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h2 className="font-semibold">
           Team · {n} of {seats ?? "–"} seats
         </h2>
-        <Button size="sm" onClick={() => setOpen(true)} disabled={!!seats && n >= seats}>
+        <Button size="sm" onClick={() => setOpen(true)}>
           <UserPlus className="h-4 w-4" /> Invite designer
         </Button>
       </div>
+      {members.isLoading && (
+        <div className="space-y-2 py-1">
+          <Skeleton className="h-11" />
+          <Skeleton className="h-11" />
+        </div>
+      )}
       <ul className="divide-y divide-line">
         {members.data?.map((m) => (
           <li key={m.user.id} className="flex items-center justify-between gap-3 py-2.5">
@@ -316,6 +337,17 @@ function Team({ seats }: { seats?: number }) {
               <p className="text-xs text-muted">{m.user.phone}</p>
             </div>
             <div className="flex items-center gap-2">
+              {m.role !== "owner" && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  loading={link.isPending && link.variables?.id === m.user.id}
+                  onClick={() => link.mutate({ id: m.user.id, name: m.user.full_name ?? "", phone: m.user.phone })}
+                  title="A new one-time login link (the old one stops working)"
+                >
+                  <Link2 className="h-4 w-4" /> Login link
+                </Button>
+              )}
               <Badge tone={m.role === "owner" ? "accent" : "neutral"}>{m.role === "owner" ? "Owner" : "Designer"}</Badge>
               {m.role !== "owner" && (
                 <button
@@ -331,32 +363,100 @@ function Team({ seats }: { seats?: number }) {
         ))}
       </ul>
       <p className="mt-2 text-xs text-muted">All team members share the same credits and parties.</p>
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent title="Invite designer" description="They log in with this phone number.">
-          <form
-            className="space-y-4"
-            onSubmit={(e) => {
-              e.preventDefault();
-              invite.mutate();
-            }}
-          >
-            <Field label="Name">
-              <Input value={name} onChange={(e) => setName(e.target.value)} />
-            </Field>
-            <Field label="Phone / WhatsApp">
-              <Input value={phone} onChange={(e) => setPhone(e.target.value)} inputMode="tel" placeholder="+91" required />
-            </Field>
-            <div className="flex items-center justify-between gap-2">
-              <PendingTag />
-              <div className="flex gap-2">
-                <Button type="button" onClick={() => setOpen(false)}>Cancel</Button>
-                <Button type="submit" variant="primary" loading={invite.isPending}>Send invite</Button>
+      <Dialog open={open} onOpenChange={(o) => (o ? setOpen(true) : close())}>
+        <DialogContent
+          title={share ? "Share the login link" : "Invite designer"}
+          description={share ? "The link logs them in once. After that they use their mobile number and password." : "You choose their password."}
+        >
+          {share ? (
+            <InviteShareBox share={share} onDone={close} />
+          ) : (
+            <form
+              className="space-y-4"
+              onSubmit={(e) => {
+                e.preventDefault();
+                invite.mutate();
+              }}
+            >
+              <Field label="Name">
+                <Input value={name} onChange={(e) => setName(e.target.value)} />
+              </Field>
+              <Field label="Mobile / WhatsApp">
+                <Input value={phone} onChange={(e) => setPhone(e.target.value)} inputMode="tel" placeholder="98250 12345" required />
+              </Field>
+              <Field label="Password for them" hint="At least 8 characters. They can change it later.">
+                <Input value={password} onChange={(e) => setPassword(e.target.value)} minLength={8} required />
+              </Field>
+              <div className="flex justify-end gap-2">
+                <Button type="button" onClick={close}>
+                  Cancel
+                </Button>
+                <Button type="submit" variant="primary" loading={invite.isPending}>
+                  Add designer
+                </Button>
               </div>
-            </div>
-          </form>
+            </form>
+          )}
         </DialogContent>
       </Dialog>
     </Card>
+  );
+}
+
+type InviteShare = { name: string; phone: string; password: string | null; code: string; path: string; expires: string };
+
+/** The login link, its passcode and the password, ready to copy or send on WhatsApp. */
+function InviteShareBox({ share, onDone }: { share: InviteShare; onDone: () => void }) {
+  const url = `${window.location.origin}${share.path}`;
+  const text = [
+    `Hi${share.name ? ` ${share.name}` : ""}, you are invited to Magic Outline.`,
+    `Open this link to log in (it works once): ${url}`,
+    `Passcode: ${share.code}`,
+    share.password ? `Next time log in with your mobile number and this password: ${share.password}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const digits = share.phone.replace(/\D/g, "");
+  const wa = `https://wa.me/${digits.length === 10 ? `91${digits}` : digits}?text=${encodeURIComponent(text)}`;
+  return (
+    <div className="space-y-4">
+      <div className="space-y-1 rounded-lg bg-canvas p-3 text-sm">
+        <p className="break-all">
+          <span className="text-muted">Link: </span>
+          {url}
+        </p>
+        <p>
+          <span className="text-muted">Passcode: </span>
+          <span className="font-mono font-semibold">{share.code}</span>
+        </p>
+        {share.password && (
+          <p>
+            <span className="text-muted">Password: </span>
+            <span className="font-mono">{share.password}</span>
+          </p>
+        )}
+      </div>
+      <p className="text-xs text-muted">
+        The link and passcode work once, until {shortDate(share.expires)}. Anyone who opens it after that is refused. Need a
+        new one? Use Login link next to the designer.
+      </p>
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button
+          onClick={() => {
+            navigator.clipboard?.writeText(text);
+            toast.success("Copied.");
+          }}
+        >
+          <Copy className="h-4 w-4" /> Copy
+        </Button>
+        <a href={wa} target="_blank" rel="noreferrer" className={buttonVariants({ variant: "secondary" })}>
+          <MessageCircle className="h-4 w-4" /> Send on WhatsApp
+        </a>
+        <Button variant="primary" onClick={onDone}>
+          Done
+        </Button>
+      </div>
+    </div>
   );
 }
 
@@ -402,6 +502,7 @@ function Invoices() {
   return (
     <Card className="p-5">
       <h2 className="mb-3 font-semibold">Invoices</h2>
+      {invoices.isLoading && <Skeleton className="h-16" />}
       {invoices.data && invoices.data.length === 0 && <p className="text-sm text-muted">No invoices yet.</p>}
       <ul className="divide-y divide-line">
         {invoices.data?.map((i) => (

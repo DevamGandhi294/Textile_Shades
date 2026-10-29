@@ -8,16 +8,16 @@ import { CREDIT_COST } from "@/lib/api/types";
 import { cn } from "@/lib/utils";
 import { Button, Input, Label, PendingTag, Segmented, Select, Slider, Switch } from "../ui/primitives";
 
-/** Settings the backend does not have yet; kept with the version so nothing is lost. */
+/** Edits of the result shown (flip, mirror, height, fill), kept with the version so nothing is lost. */
 export interface PendingSettings {
   height_cm: number;
-  fill_repeat: boolean;
+  fill: "repeat" | "stretch" | "fit"; // how a new width and height are filled
   flip_h: boolean;
   flip_v: boolean;
   mirror_half: boolean;
 }
 
-export const DEFAULT_PENDING: PendingSettings = { height_cm: 0, fill_repeat: false, flip_h: false, flip_v: false, mirror_half: false };
+export const DEFAULT_PENDING: PendingSettings = { height_cm: 0, fill: "repeat", flip_h: false, flip_v: false, mirror_half: false };
 
 function Section({ title, tag, children }: { title: string; tag?: boolean; children: React.ReactNode }) {
   return (
@@ -76,6 +76,9 @@ export function SettingsPanel({
   dirty,
   onPaidAction,
   paidBusy,
+  onEdit,
+  editBusy,
+  hasResult,
 }: {
   designId: string;
   settings: OutlineSettings;
@@ -85,8 +88,12 @@ export function SettingsPanel({
   onApply: () => void;
   applying: boolean;
   dirty: boolean;
-  onPaidAction: (action: "watermark" | "resize_fill") => void;
+  onPaidAction: (action: "watermark") => void;
   paidBusy: string | null;
+  /** Free edits of the result shown: "flip" = flips and mirror, "size" = width, height and fill. */
+  onEdit: (kind: "flip" | "size") => void;
+  editBusy: "flip" | "size" | null;
+  hasResult: boolean;
 }) {
   const [thickMode, setThickMode] = useState<"adjust" | "fixed">(settings.uniform_width > 0 ? "fixed" : "adjust");
   const [more, setMore] = useState(false);
@@ -96,15 +103,19 @@ export function SettingsPanel({
   return (
     <div className="flex h-full flex-col">
       <div className="flex-1 overflow-y-auto">
-        <Section title="Remove watermark and text" tag>
+        <Section title="Remove watermark and text">
           <Button
             size="sm"
             className="w-full"
             onClick={() => onPaidAction("watermark")}
             loading={paidBusy === "watermark"}
+            disabled={!hasResult || !!paidBusy}
           >
-            <Scissors className="h-4 w-4" /> Remove watermark · {CREDIT_COST.watermark} credit
+            <Scissors className="h-4 w-4" /> Remove watermark · {CREDIT_COST.watermark} credits
           </Button>
+          <p className="mt-1 text-[11px] text-muted">
+            The AI removes logos, numbers and text from the result shown, and changes nothing else. Makes a new version.
+          </p>
         </Section>
 
         <Section title="Resize and fill">
@@ -134,17 +145,26 @@ export function SettingsPanel({
               />
             </div>
           </div>
-          <p className="mt-1 text-[11px] text-muted">Width sets the real size of the files. Height keeps the shape for now.</p>
-          <label className="mt-3 flex items-center justify-between gap-2 text-[13px]">
-            <span>Fill blank space by repeating the motif</span>
-            <Switch checked={pending.fill_repeat} onChange={(v) => setP("fill_repeat", v)} aria-label="Fill by repeating" />
-          </label>
-          <div className="mt-2 flex items-center justify-between gap-2">
-            <Button size="sm" variant="ghost" onClick={() => onPaidAction("resize_fill")} loading={paidBusy === "resize_fill"} className="-ml-2">
-              <Wand2 className="h-4 w-4" /> Fill with AI · {CREDIT_COST.resize_fill} credits
-            </Button>
-            <PendingTag />
-          </div>
+          <p className="mt-1 text-[11px] text-muted">Only a width keeps the shape. With both, choose how the new shape is filled:</p>
+          <Segmented
+            className="mt-2 w-full"
+            value={pending.fill}
+            onChange={(v) => setP("fill", v)}
+            options={[
+              { value: "repeat", label: "Repeat motif" },
+              { value: "stretch", label: "Stretch" },
+              { value: "fit", label: "Fit" },
+            ]}
+          />
+          <Button
+            size="sm"
+            className="mt-3 w-full"
+            onClick={() => onEdit("size")}
+            loading={editBusy === "size"}
+            disabled={!hasResult || !!editBusy || (!settings.width_cm && !pending.height_cm)}
+          >
+            <Wand2 className="h-4 w-4" /> Resize the result · free
+          </Button>
         </Section>
 
         <Section title="Line thickness">
@@ -193,7 +213,7 @@ export function SettingsPanel({
           </label>
         </Section>
 
-        <Section title="Mirror and flip" tag>
+        <Section title="Mirror and flip">
           <div className="grid grid-cols-3 gap-1.5">
             <Toggle on={pending.flip_h} onClick={() => setP("flip_h", !pending.flip_h)}>
               <FlipHorizontal2 className="h-4 w-4" /> Flip ↔
@@ -205,6 +225,15 @@ export function SettingsPanel({
               <PanelLeftClose className="h-4 w-4" /> Mirror half
             </Toggle>
           </div>
+          <Button
+            size="sm"
+            className="mt-3 w-full"
+            onClick={() => onEdit("flip")}
+            loading={editBusy === "flip"}
+            disabled={!hasResult || !!editBusy || !(pending.flip_h || pending.flip_v || pending.mirror_half)}
+          >
+            Apply to the result · free
+          </Button>
         </Section>
 
         <Section title="Smoothness">

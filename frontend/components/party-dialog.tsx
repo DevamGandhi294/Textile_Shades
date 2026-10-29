@@ -17,7 +17,6 @@ import {
   DialogContent,
   Field,
   Input,
-  PendingTag,
   Select,
   Switch,
   Textarea,
@@ -284,7 +283,6 @@ export function PartyDialog({
               >
                 <RefreshCw className="h-3.5 w-3.5" /> Rebuild from chats
               </Button>
-              <PendingTag />
               </div>
               <label className="flex items-center gap-2 text-sm">
                 Auto-update

@@ -43,6 +43,7 @@ export function DownloadMenu({
   hasPerfect,
   hasLayers,
   hasAiLayers,
+  layersVersionId,
   fallbackImage,
   fallbackName,
   label = "Download",
@@ -54,6 +55,8 @@ export function DownloadMenu({
   hasPerfect?: boolean;
   hasLayers?: boolean;
   hasAiLayers?: boolean;
+  /** A saved image with its layers: its PSD comes from storage, so it works after the image session ends. */
+  layersVersionId?: string | null;
   fallbackImage?: string | null;
   fallbackName?: string;
   label?: string;
@@ -62,6 +65,18 @@ export function DownloadMenu({
   const [busy, setBusy] = useState<string | null>(null);
 
   async function get(fmt: ExportFormat) {
+    if (fmt === "ai-layers-psd" && layersVersionId) {
+      setBusy(fmt);
+      try {
+        await outlineApi.savedLayersPsd(layersVersionId);
+        await designsApi.recordExport(designId, fmt);
+      } catch (e) {
+        toast.error((e as Error).message);
+      } finally {
+        setBusy(null);
+      }
+      return;
+    }
     if (!sid) return;
     setBusy(fmt);
     try {
@@ -109,7 +124,7 @@ export function DownloadMenu({
         {BITMAP.map((i) => row(i, can(i.fmt)))}
         <DropdownSeparator />
         {AI.map((i) => row(i, !!sid && !!hasPerfect))}
-        {row(AI_LAYERS, !!sid && !!hasAiLayers)}
+        {row(AI_LAYERS, !!layersVersionId || (!!sid && !!hasAiLayers))}
         {LAYERS.map((i) => row(i, !!sid && !!hasLayers))}
         <DropdownSeparator />
         {row({ fmt: "zip", label: "Everything (ZIP)", hint: "All files" }, !!sid)}

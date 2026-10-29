@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from . import storage
 from .models import (Account, Chat, ChatMessage, CreditHold, Design, DesignVersion, Export, Party,
-                     PartyReference, Plan, Subscription, User)
+                     PartyReference, Plan, Subscription, User, VersionLayer)
 
 
 def as_uuid(value, what="item") -> uuid.UUID:
@@ -57,14 +57,14 @@ def subscription_out(s: Subscription) -> dict:
 
 # ------------------------------------------------------------------ designs
 
-def version_out(v: DesignVersion) -> dict:
+def version_out(v: DesignVersion, layer_count: int = 0) -> dict:
     return {"id": str(v.id), "design_id": str(v.design_id), "parent_id": str(v.parent_id) if v.parent_id else None,
             "kind": v.kind, "label": v.label, "note": v.note,
             "image_url": storage.url_for(v.storage_key), "thumb_url": storage.url_for(v.thumb_key or v.storage_key),
             "width_px": v.width_px, "height_px": v.height_px, "dpi": v.dpi,
             "width_mm": num(v.width_mm), "height_mm": num(v.height_mm), "settings": v.settings,
             "closed_boxes": v.closed_boxes, "gaps_joined": v.gaps_joined, "credits": v.credits,
-            "size_bytes": v.size_bytes,
+            "size_bytes": v.size_bytes, "layer_count": layer_count,     # saved layers (PSD can be made again)
             "chat_message_id": str(v.chat_message_id) if v.chat_message_id else None,
             "created_at": iso(v.created_at)}
 
@@ -78,6 +78,10 @@ def designs_out(db: Session, designs: List[Design]) -> List[dict]:
     for v in db.scalars(select(DesignVersion).where(DesignVersion.design_id.in_(ids))
                         .order_by(DesignVersion.created_at, DesignVersion.id)):
         versions[v.design_id].append(v)
+    layer_count = dict(db.execute(select(VersionLayer.version_id, func.count())
+                                  .where(VersionLayer.version_id.in_([v.id for vs in versions.values() for v in vs]),
+                                         VersionLayer.mask_key.is_not(None))
+                                  .group_by(VersionLayer.version_id)).all())
     chat_count = dict(db.execute(select(Chat.design_id, func.count()).where(Chat.design_id.in_(ids))
                                  .group_by(Chat.design_id)).all())
     charged = dict(db.execute(select(CreditHold.design_id, func.sum(CreditHold.credits))
@@ -96,7 +100,7 @@ def designs_out(db: Session, designs: List[Design]) -> List[dict]:
             "id": str(d.id), "party_id": str(d.party_id) if d.party_id else None, "name": d.name,
             "current_version_id": str(d.current_version_id) if d.current_version_id else None,
             "created_at": iso(d.created_at), "updated_at": iso(d.updated_at),
-            "versions": [version_out(v) for v in vs],
+            "versions": [version_out(v, layer_count.get(v.id, 0)) for v in vs],
             "chat_count": chat_count.get(d.id, 0),
             "credits_used": int(charged.get(d.id) or sum(v.credits for v in vs)),
             "last_exports": exports[d.id][:3],

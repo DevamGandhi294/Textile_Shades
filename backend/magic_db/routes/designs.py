@@ -165,6 +165,7 @@ def delete_version(design_id: str, version_id: str, cur: Current = Depends(curre
         raise HTTPException(404, "Image not found.")
     keys = [v.storage_key, v.thumb_key]
     keys += db.scalars(select(Export.storage_key).where(Export.version_id == v.id)).all()
+    keys += db.scalars(select(VersionLayer.mask_key).where(VersionLayer.version_id == v.id)).all()  # saved layers
     if d.current_version_id == v.id:
         d.current_version_id = v.parent_id
     db.delete(v)

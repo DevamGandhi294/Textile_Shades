@@ -73,6 +73,15 @@ PASSWORD_MIN_LENGTH = _int("PASSWORD_MIN_LENGTH", 8)
 LOGIN_MAX_FAILS = _int("LOGIN_MAX_FAILS", 5)               # wrong passwords before a short lock
 LOGIN_LOCK_MINUTES = _int("LOGIN_LOCK_MINUTES", 15)
 
+# ------------------------------------------------------------------ Google login
+# The OAuth client id from Google Cloud Console (APIs & Services -> Credentials -> OAuth client ID, type
+# "Web application"). Empty = Google login is off. The website needs the same id (NEXT_PUBLIC_GOOGLE_CLIENT_ID).
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_SIGNUP_MINUTES = _int("GOOGLE_SIGNUP_MINUTES", 30)  # time to fill in the shop details after Google
+
+# ------------------------------------------------------------------ team invites
+INVITE_DAYS = _int("INVITE_DAYS", 7)                       # a login link for a new designer works once, this long
+
 # ------------------------------------------------------------------ OTP (login and "forgot password")
 SMS_PROVIDER = os.environ.get("SMS_PROVIDER", "console")   # console = OTP printed in the server log
 OTP_DEV_ECHO = _bool("OTP_DEV_ECHO")                       # 1 = also return the code in the API reply (dev only)
@@ -94,6 +103,9 @@ CREDIT_LABEL = {
     "multi_colour_hd": "Multi-colour HD outline",
     "chat": "Chat edit",
 }
+# 0 = testing: no credit, HD, storage, seat or party limits (usage is still written in the ledger).
+# Keep it on (the default) on a real server.
+BILLING_CHECKS = _bool("BILLING_CHECKS", True)
 TOP_UP_CREDITS = _int("TOP_UP_CREDITS", 50)
 TOP_UP_PRICE_INR = _int("TOP_UP_PRICE_INR", 249)
 HOLD_MINUTES = _int("HOLD_MINUTES", 15)                    # a reserve not settled by then is given back

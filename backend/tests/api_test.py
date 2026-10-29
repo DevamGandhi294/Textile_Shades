@@ -583,9 +583,11 @@ def test_perfect_psd_without_colours_still_has_the_lines_layer():
 
 import layer_pipeline  # noqa: E402
 
-LAYERS = [{"name": "Outline", "description": "All the black outlines of the design.", "border_color": "#111111"},
-          {"name": "Flowers", "description": "The dark pink flower petals.", "border_color": "#C2185B"},
-          {"name": "Leaves", "description": "The green leaves.", "border_color": "#558b2f"}]
+LAYERS = [{"name": "Outline", "description": "All the black outlines of the design.", "fill_color": "#222222",
+           "border_color": "#111111"},
+          {"name": "Flowers", "description": "The dark pink flower petals.", "fill_color": "#e04080",
+           "border_color": "#C2185B"},
+          {"name": "Leaves", "description": "The green leaves.", "fill_color": "#80b040", "border_color": "#558b2f"}]
 
 
 def analysis(**changes):
@@ -602,10 +604,10 @@ class Answer:
 
 
 class FakeOpenAI:
-    """Replaces httpx.post: the analysis (chat completions) and every layer picture (image edits)."""
+    """Replaces httpx.post: the analysis (chat completions) and the outline picture (image edits)."""
 
-    def __init__(self, answer, fail=()):
-        self.answer, self.fail = answer, set(fail)          # fail: names of layers whose image call fails
+    def __init__(self, answer, fail=False):
+        self.answer, self.fail = answer, fail               # fail: the image call fails
         self.chats, self.images = [], []
 
     def __call__(self, url, json=None, data=None, files=None, headers=None, timeout=None):
@@ -617,7 +619,7 @@ class FakeOpenAI:
             content = self.answer if isinstance(self.answer, str) else __import__("json").dumps(self.answer)
             return Answer(200, {"choices": [{"message": {"content": content, "refusal": None}}], "usage": {"total_tokens": 5}})
         self.images.append({"data": data, "files": files})
-        if any(f'Layer "{name}"' in data["prompt"] for name in self.fail):
+        if self.fail:
             return Answer(500, {"error": {"message": "the image model is busy"}})
         if data.get("background") == "transparent":                          # a model that draws on transparency
             img = np.zeros((1536, 1024, 4), np.uint8)
@@ -629,7 +631,7 @@ class FakeOpenAI:
         return Answer(200, {"data": [{"b64_json": png}], "usage": {"total_tokens": 9}})
 
 
-def with_openai(answer, fn, fail=()):
+def with_openai(answer, fn, fail=False):
     fake = FakeOpenAI(answer, fail)
     real_post, real_key = perfect.httpx.post, os.environ.get("OPENAI_API_KEY")
     perfect.httpx.post, os.environ["OPENAI_API_KEY"] = fake, "sk-test"
@@ -706,41 +708,90 @@ def test_ai_analysis_errors_are_readable():
     assert r.status_code == 502 and "OPENAI_API_KEY" in r.json()["detail"], r.text
 
 
-def test_ai_layers_make_one_image_call_per_layer_and_a_layered_psd():
+def ai_layers_of(sid):
+    """The layers kept for this photo: [(name, rgba)], the background colour first."""
+    return api._sessions[sid].ai_layers["layers"]
+
+
+def test_ai_layers_make_one_image_call_and_cut_it_into_aligned_layers():
     def run(fake):
         sid = new_colour_session()
         assert client.post(f"/api/sessions/{sid}/ai-layers").status_code == 400, "check the design first"
         analyse(sid, "embroidery")
         r = client.post(f"/api/sessions/{sid}/ai-layers")
         assert r.status_code == 200, r.text
-        assert len(fake.images) == 3, "one image call per layer"
-        assert [x["name"] for x in r.json()["layers"]] == ["Background colour", "Outline", "Flowers", "Leaves"], \
-            "the background colour is one extra layer, made without an AI call"
-        assert r.json()["image"].startswith("data:image/png")
-        assert r.json()["runs"] == {"used": 1, "limit": 2}
-        for layer in LAYERS:
-            call = next(c for c in fake.images if f'Layer "{layer["name"]}"' in c["data"]["prompt"])
-            prompt = call["data"]["prompt"]
-            assert layer["description"] in prompt and "Machine type: Embroidery" in prompt, prompt[:300]
-            assert "fully closed border" in prompt and "OUTLINES ONLY" in prompt and "NO FILL" in prompt
-            assert f"this one colour: {layer['border_color'].lower()}" in prompt, "every layer has its own border colour"
-            assert call["data"]["model"] == layer_pipeline.MODEL_COMPLETE
-            assert "background" not in call["data"] and "pure white" in prompt, "2.5 is asked for white, which is made transparent"
+        assert len(fake.images) == 1, "ONE image call for all the layers"
+        names = [x["name"] for x in r.json()["layers"]]
+        assert names[0] == "Background colour", "the background colour is one extra layer, made without an AI call"
+        assert len(names) > 1 and all(n in ("Outline", "Flowers", "Leaves") or "details" in n for n in names[1:]), names
+        assert r.json()["image"].startswith("data:image/png") and r.json()["runs"] == {"used": 1, "limit": 2}
+        call = fake.images[0]["data"]
+        prompt = call["prompt"]
+        assert "Machine type: Embroidery" in prompt and "OUTLINES ONLY" in prompt and "NO FILL" in prompt
+        assert "EXACTLY the same position" in prompt and all(l["description"] in prompt for l in LAYERS)
+        assert call["model"] == layer_pipeline.MODEL_COMPLETE and "pure white" in prompt, "2.5 draws on white"
+        layers = ai_layers_of(sid)[1:]
+        drawn = [rgba[..., 3] > 0 for _, rgba in layers]
+        assert sum(d.sum() for d in drawn) > 0 and not (sum(d.astype(int) for d in drawn) > 1).any(), \
+            "every outline pixel is in exactly one layer: the layers never overlap and always line up"
+        for name, rgba in layers:
+            assert (rgba[..., 3] > 0).any(), f"{name}: layers without outlines are left out"
+            layer = next((l for l in LAYERS if l["name"] == name), None)
+            if layer:
+                assert tuple(rgba[rgba[..., 3] > 0][0][:3]) == tuple(layer_pipeline._rgb(layer["border_color"].lower())), \
+                    f"{name} is drawn in its own border colour"
         psd = open_psd(client.get(f"/api/sessions/{sid}/download", params={"fmt": "ai-layers-psd"}).content)
-        assert [x.name for x in psd] == ["Background", "Reference (original photo)", "Background colour", "Outline", "Flowers",
-                                         "Leaves"], [x.name for x in psd]
-        assert [x.visible for x in psd] == [True, False, True, True, True, True]
-        flat = psd.composite()
-        bar = (int(150 / 1024 * psd.width), int(620 / 1536 * psd.height))        # where the fake AI drew its border
-        assert flat.getpixel((5, 5)) == (0x1f, 0x7a, 0x78), "the background colour layer covers the page"
-        assert flat.getpixel(bar) == (0x55, 0x8b, 0x2f), "the white drawn by the AI is transparent; the top layer's border colour"
-        hidden = client.get(f"/api/sessions/{sid}/ai-layers", params={"hidden": "0,1,2"}).json()
+        assert [x.name for x in psd] == ["Background", "Reference (original photo)"] + names, [x.name for x in psd]
+        assert [x.visible for x in psd] == [True, False] + [True] * len(names)
+        assert psd.composite().getpixel((5, 5)) == (0x1f, 0x7a, 0x78), "the background colour layer covers the page"
+        hidden = client.get(f"/api/sessions/{sid}/ai-layers", params={"hidden": "0"}).json()
         assert hidden["image"] != r.json()["image"] and hidden["made"] is True
         logged = [json.loads(line) for line in api.USAGE_LOG.read_text(encoding="utf-8").splitlines()]
-        layers_logged = [x for x in logged if x["source"] == "ai-layer"]
-        assert sorted(x["layer"] for x in layers_logged) == ["Flowers", "Leaves", "Outline"] and all(x["prompt"] for x in layers_logged)
+        made = [x for x in logged if x["source"] == "ai-layers"]
+        assert len(made) == 1 and made[0]["prompt"] and made[0]["layer"] == ", ".join(names[1:])
         assert any(x["source"] == "ai-analyse" and x["analysis"]["layers"] == ["Outline", "Flowers", "Leaves"] for x in logged)
     with_openai(analysis(), run)
+
+
+def test_outlines_go_to_the_layer_of_the_colour_the_photo_has_there():
+    photo = np.zeros((60, 100, 3), np.uint8)
+    photo[:, :50] = (0, 0, 255)                                         # left half blue flowers
+    photo[:, 50:] = (255, 0, 128)                                       # right half pink flowers
+    photo[:8] = (255, 255, 255)                                         # a strip of background at the top
+    outlines = np.zeros((60, 100, 4), np.uint8)
+    outlines[10:50, 10:12, 3] = 255                                     # a line on the blue side ...
+    outlines[10:50, 88:90, 3] = 255                                     # ... and one on the pink side
+    outlines[2:4, 10:20, 3] = 255                                       # an edge in the background, next to blue
+    plan = {"image_type": "color", "mirror": False, "background_color": "#ffffff",
+            "layers": [{"name": "Blue", "fill_color": "#0000ff", "border_color": "#000080"},
+                       {"name": "Pink", "fill_color": "#ff0080", "border_color": "#800040"}]}
+    (blue_name, blue), (pink_name, pink) = layer_pipeline.split_layers(outlines, photo, plan)
+    assert (blue_name, pink_name) == ("Blue", "Pink")
+    assert blue[10:50, 10:12, 3].all() and not pink[10:50, 10:12, 3].any(), "the blue side's line is in Blue only"
+    assert pink[10:50, 88:90, 3].all() and not blue[10:50, 88:90, 3].any(), "the pink side's line is in Pink only"
+    assert blue[2:4, 10:20, 3].all(), "a line on the background goes to the nearest object's layer"
+    assert tuple(blue[20, 10, :3]) == (0, 0, 128) and tuple(pink[20, 88, :3]) == (128, 0, 64), "each in its border colour"
+    one = layer_pipeline.split_layers(outlines, photo, {**plan, "image_type": "line"})
+    assert [n for n, _ in one] == ["Outlines"] and tuple(one[0][1][20, 10, :3]) == (0x1a, 0x1a, 0x1a), \
+        "line art has one colour: one outline layer"
+
+
+def test_a_colour_the_ai_did_not_name_gets_its_own_layer():
+    photo = np.zeros((80, 120, 3), np.uint8)
+    photo[:] = (20, 120, 115)                                            # teal background
+    photo[10:70, 10:50] = (40, 210, 230)                                 # blue flower
+    photo[30:50, 70:110] = (235, 240, 220)                               # white beads: not named by the AI
+    outlines = np.zeros((80, 120, 4), np.uint8)
+    outlines[20:60, 29:32, 3] = 255                                      # inside the blue flower
+    outlines[39:42, 75:105, 3] = 255                                     # through the white beads
+    plan = {"image_type": "color", "mirror": False, "background_color": "#147873",
+            "layers": [{"name": "Blue Flowers", "fill_color": "#28d2e6", "border_color": "#0e8fa6"}]}
+    out = dict(layer_pipeline.split_layers(outlines, photo, plan))
+    assert set(out) == {"Blue Flowers", "White details"}, list(out)
+    assert out["Blue Flowers"][25:55, 28:33, 3].any() and not out["Blue Flowers"][:, 65:, 3].any(), \
+        "the white beads are NOT drawn in the blue flowers' layer"
+    assert out["White details"][38:43, 80:100, 3].any(axis=0).all(), "they get their own layer"
+    assert (out["White details"][..., 3] > 0).sum(axis=0).max() <= 6, "thick lines are made thin and even"
 
 
 def test_ai_layers_incomplete_design_uses_the_transparent_model_and_a_line_design_one_colour():
@@ -748,22 +799,19 @@ def test_ai_layers_incomplete_design_uses_the_transparent_model_and_a_line_desig
         sid = new_colour_session()
         analyse(sid, "print")
         assert client.post(f"/api/sessions/{sid}/ai-layers").status_code == 200
-        for call in fake.images:
-            assert call["data"]["model"] == layer_pipeline.MODEL_INCOMPLETE
-            assert call["data"]["background"] == "transparent" and call["data"]["output_format"] == "png"
-            assert "Machine type: Digital Print" in call["data"]["prompt"] and "single dark border colour" not in call["data"]["prompt"]
-            assert "single dark" not in call["data"]["prompt"] and "fully transparent" in call["data"]["prompt"]
-        psd = open_psd(client.get(f"/api/sessions/{sid}/download", params={"fmt": "ai-layers-psd"}).content)
-        assert psd.composite().getpixel((int(150 / 1024 * psd.width), int(620 / 1536 * psd.height))) != (255, 255, 255), \
-            "the model's own transparency is used"
+        call = fake.images[0]["data"]
+        assert len(fake.images) == 1 and call["model"] == layer_pipeline.MODEL_INCOMPLETE
+        assert call["background"] == "transparent" and call["output_format"] == "png"
+        assert "Machine type: Digital Print" in call["prompt"] and "fully transparent" in call["prompt"]
+        assert sum((rgba[..., 3] > 0).sum() for _, rgba in ai_layers_of(sid)[1:]) > 0, "the model's own transparency is used"
     with_openai(analysis(is_complete=False), run)
 
     def line(fake):
         sid = new_colour_session()
         analyse(sid, "cad")
-        client.post(f"/api/sessions/{sid}/ai-layers")
-        assert all("this one colour: #1a1a1a" in c["data"]["prompt"] and "Machine type: CAD" in c["data"]["prompt"]
-                   for c in fake.images), "a line design gets one dark border colour"
+        assert client.post(f"/api/sessions/{sid}/ai-layers").status_code == 200
+        assert "one dark colour (#1a1a1a)" in fake.images[0]["data"]["prompt"] and "Machine type: CAD" in fake.images[0]["data"]["prompt"]
+        assert [n for n, _ in ai_layers_of(sid)] == ["Background colour", "Outlines"], "line art: one outline layer"
         flat = open_psd(client.get(f"/api/sessions/{sid}/download", params={"fmt": "ai-layers-psd"}).content).composite()
         assert flat.getpixel((5, 5)) == (255, 255, 255), "a line design has a white background colour"
     with_openai(analysis(image_type="line"), line)
@@ -774,10 +822,10 @@ def test_ai_layers_of_a_symmetric_design_are_drawn_as_a_half_and_mirrored():
         sid = new_colour_session()
         analyse(sid)
         assert client.post(f"/api/sessions/{sid}/ai-layers").status_code == 200
-        assert all("LEFT HALF" in c["data"]["prompt"] for c in fake.images)
+        assert "LEFT HALF" in fake.images[0]["data"]["prompt"]
         flat = open_psd(client.get(f"/api/sessions/{sid}/download", params={"fmt": "ai-layers-psd"}).content).composite()
         arr = np.asarray(flat)
-        assert arr.shape[1] % 2 == 0 and (arr[:, : arr.shape[1] // 2] != 255).any(), "the left half has the drawing"
+        assert arr.shape[1] % 2 == 0, "the left half and its mirror"
         assert np.array_equal(arr[:, : arr.shape[1] // 2], arr[:, ::-1][:, : arr.shape[1] // 2]), "the right half is its mirror"
     with_openai(analysis(is_symmetric=True, mirror=True), run)
 
@@ -790,37 +838,27 @@ def test_ai_layers_respect_the_token_and_the_limits():
         assert fake.chats == [] and fake.images == [], "nothing is paid without the token"
         os.environ.pop("API_TOKEN")
         analyse(sid)
-        os.environ["PERFECT_MAX_PER_HOUR"] = "2"                              # 3 layers need 3 image calls
+        os.environ["PERFECT_MAX_PER_HOUR"] = "0"                              # the hour is full
         assert client.post(f"/api/sessions/{sid}/ai-layers").status_code == 429 and fake.images == []
-        assert len(api._perfect_times) == 0, "no hourly slot is kept when the run is refused"
+        assert client.get(f"/api/sessions/{sid}/ai-layers").json()["runs"]["used"] == 0, "a refused run is not counted"
         os.environ.pop("PERFECT_MAX_PER_HOUR")
         os.environ["AI_LAYERS_MAX_RUNS_PER_SESSION"] = "1"
         assert client.post(f"/api/sessions/{sid}/ai-layers").status_code == 200
-        assert client.post(f"/api/sessions/{sid}/ai-layers").status_code == 429 and len(fake.images) == 3
+        assert len(api._perfect_times) == 1, "one hourly slot for all the layers"
+        assert client.post(f"/api/sessions/{sid}/ai-layers").status_code == 429 and len(fake.images) == 1
     with_openai(analysis(), run)
 
 
-def test_ai_layers_keep_the_layers_that_worked_when_one_fails():
+def test_ai_layers_that_fail_cost_nothing():
     def run(fake):
         sid = new_colour_session()
         analyse(sid)
         r = client.post(f"/api/sessions/{sid}/ai-layers")
-        assert r.status_code == 502, r.text
-        detail = r.json()["detail"]
-        assert "1 of 3 layers could not be made (Flowers)" in detail and "the image model is busy" in detail and "The other 2 were kept" in detail, detail
-        kept = client.get(f"/api/sessions/{sid}/ai-layers").json()
-        assert kept["made"] is True and [x["name"] for x in kept["layers"]] == ["Background colour", "Outline", "Leaves"]
-        assert len(api._perfect_times) == 2, "the layer that was not made gives its hourly slot back"
-        assert client.get(f"/api/sessions/{sid}/download", params={"fmt": "ai-layers-psd"}).status_code == 200
-    with_openai(analysis(), run, fail=("Flowers",))
-
-    def all_fail(fake):
-        sid = new_colour_session()
-        analyse(sid)
-        assert client.post(f"/api/sessions/{sid}/ai-layers").status_code == 502
+        assert r.status_code == 502 and "the image model is busy" in r.json()["detail"], r.text
         assert client.get(f"/api/sessions/{sid}/ai-layers").json()["runs"]["used"] == 0, "nothing made: the run is not counted"
+        assert len(api._perfect_times) == 0, "the hourly slot is given back"
         assert client.get(f"/api/sessions/{sid}/download", params={"fmt": "ai-layers-psd"}).status_code == 404
-    with_openai(analysis(), all_fail, fail=("Outline", "Flowers", "Leaves"))
+    with_openai(analysis(), run, fail=True)
 
 
 def test_a_fast_upload_makes_only_the_scan_and_the_lines_when_a_file_needs_them():
@@ -854,6 +892,29 @@ def test_refit_keeps_a_background_that_touches_the_page_edge():
 
 
 # ----------------------------------------------------------------- runner
+
+def test_transform_flips_mirrors_resizes_and_repeats_the_motif():
+    rgba = np.zeros((10, 20, 4), np.uint8)
+    rgba[:, :5] = (255, 0, 0, 255)                                    # a red stripe on the left
+    T = api.TransformIn
+    assert (api.transform_rgba(rgba, T(flip_h=True))[:, -5:, 0] == 255).all(), "flip: the stripe is on the right"
+    m = api.transform_rgba(rgba, T(mirror_half=True))
+    assert m.shape == rgba.shape and (m[:, -5:, 0] == 255).all() and (m[:, :5, 0] == 255).all(), "mirror half"
+    assert (api.transform_rgba(rgba, T(flip_v=True)) == rgba).all(), "nothing changes top to bottom here"
+    cm = lambda px: px * 2.54 / 100                                   # at 100 DPI
+    keep = api.transform_rgba(rgba, T(width_cm=cm(40), dpi=100))
+    assert keep.shape[:2] == (20, 40), "only a width keeps the shape"
+    rep = api.transform_rgba(rgba, T(width_cm=cm(60), height_cm=cm(10), fill="repeat", dpi=100))
+    assert rep.shape[:2] == (10, 60) and (rep[:, 20:25, 0] == 255).all() and (rep[:, 40:45, 0] == 255).all(), \
+        "repeat: the motif is tiled across the new width"
+    fit = api.transform_rgba(rgba, T(width_cm=cm(60), height_cm=cm(10), fill="fit", dpi=100))
+    assert fit.shape[:2] == (10, 60) and fit[:, :20, 3].max() == 0, "fit: transparent around the picture"
+    try:
+        api.transform_rgba(rgba, T(width_cm=300, height_cm=300, dpi=1200))
+        raise AssertionError("a huge size must be refused")
+    except api.HTTPException as e:
+        assert e.status_code == 422 and "too large" in e.detail
+
 
 def main():
     tests = [(n, f) for n, f in globals().items() if n.startswith("test_") and callable(f)]

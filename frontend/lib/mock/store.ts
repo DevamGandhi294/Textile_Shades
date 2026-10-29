@@ -279,6 +279,16 @@ export const mockDesigns = {
       return { ok: true };
     }, 0),
 
+  removeVersion: (did: string, vid: string) =>
+    tx((d) => {
+      const x = d.designs.find((y) => y.id === did);
+      if (!x) throw new ApiError(404, "Design not found.");
+      const v = x.versions.find((y) => y.id === vid);
+      x.versions = x.versions.filter((y) => y.id !== vid);
+      if (x.current_version_id === vid) x.current_version_id = v?.parent_id ?? x.versions.at(-1)?.id ?? null;
+      return { ok: true };
+    }),
+
   remove: (did: string) =>
     tx((d) => {
       d.designs = d.designs.filter((x) => x.id !== did);

@@ -13,7 +13,7 @@ if not url:
 os.environ.update({
     "DATABASE_URL": url, "STORAGE_BACKEND": "local", "LOCAL_STORAGE_DIR": tempfile.mkdtemp(prefix="magic_db_"),
     "OTP_DEV_ECHO": "1", "PAYMENTS_MODE": "fake", "API_TOKEN": "", "DEV_LOGIN_PHONE": "", "OPENAI_API_KEY": "",
-    "SECRET_KEY": "test-secret",
+    "SECRET_KEY": "test-secret", "BILLING_CHECKS": "1",          # the tests check the limits
 })
 if os.environ.get("TEST_S3_ENDPOINT_URL"):          # e.g. MinIO from docker-compose: http://127.0.0.1:9000
     os.environ.update({"STORAGE_BACKEND": "s3", "S3_ENDPOINT_URL": os.environ["TEST_S3_ENDPOINT_URL"],

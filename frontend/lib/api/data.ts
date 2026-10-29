@@ -34,6 +34,30 @@ const post = <T,>(path: string, body: unknown = {}) => request<T>(`${API_BASE}${
 const patch = <T,>(path: string, body: unknown) =>
   request<T>(`${API_BASE}${path}`, { ...jsonBody(body), method: "PATCH" });
 
+/** A one-time login link for a designer: /join?code=ABCDE-FGH23 (the code is also the passcode). */
+export interface InviteLink {
+  ok: boolean;
+  invite_code: string;
+  invite_path: string;
+  invite_expires_at: string;
+}
+
+const demoOnly = (): Promise<never> => Promise.reject(new Error("Team invites need the real backend (NEXT_PUBLIC_USE_MOCKS=0)."));
+
+export type GoogleAnswer =
+  | { logged_in: true; me: Me }
+  | { logged_in: false; signup_token: string; email: string; full_name: string };
+
+/** Same fields as GoogleCompleteIn in backend/magic_db/schemas.py. */
+export interface GoogleDetails {
+  signup_token: string;
+  phone: string;
+  company_name: string;
+  owner_name?: string | null;
+  city?: string | null;
+  gstin?: string | null;
+}
+
 /** Same fields as RegisterIn in backend/magic_db/schemas.py. */
 export interface RegisterInput {
   phone: string;
@@ -52,6 +76,18 @@ export const authApi = {
     USE_MOCKS ? mockAuth.me() : post("/auth/login", { phone, password }),
   register: (input: RegisterInput): Promise<Me> => (USE_MOCKS ? mockAuth.me() : post("/auth/register", input)),
   logout: () => (USE_MOCKS ? Promise.resolve({ ok: true }) : post("/auth/logout")),
+  /** Is Google login on (GOOGLE_CLIENT_ID in backend/.env)? */
+  googleConfig: (): Promise<{ enabled: boolean; client_id: string | null }> =>
+    USE_MOCKS ? Promise.resolve({ enabled: false, client_id: null }) : get("/auth/google/config"),
+  /** Step 1: a known person is logged in at once; a new person gets a signup token for step 2. */
+  google: (credential: string): Promise<GoogleAnswer> => (USE_MOCKS ? demoOnly() : post("/auth/google", { credential })),
+  /** Step 2 for a new person: the shop and mobile number; logs in. */
+  googleComplete: (input: GoogleDetails): Promise<Me> => (USE_MOCKS ? demoOnly() : post("/auth/google/complete", input)),
+  /** Who a login link is for, before it is used. */
+  inviteCheck: (code: string): Promise<{ business_name: string; full_name: string | null; phone: string; expires_at: string }> =>
+    USE_MOCKS ? demoOnly() : post("/auth/invite/check", { code }),
+  /** Logs in with a login link; it works once. */
+  inviteAccept: (code: string): Promise<Me> => (USE_MOCKS ? demoOnly() : post("/auth/invite/accept", { code })),
   updateProfile: (input: { full_name: string; business_name: string; gstin: string | null }) =>
     USE_MOCKS ? mockAuth.updateProfile(input) : patch("/me", input),
 };
@@ -87,6 +123,11 @@ export const designsApi = {
     USE_MOCKS ? mockDesigns.recordExport(id, fmt) : post(`/designs/${id}/exports`, { format: fmt }),
   remove: (id: string) =>
     USE_MOCKS ? mockDesigns.remove(id) : request(`${API_BASE}/designs/${id}`, { method: "DELETE" }),
+  /** Deletes one image of the design (and its saved layers); the design keeps the others. */
+  removeVersion: (id: string, versionId: string) =>
+    USE_MOCKS
+      ? mockDesigns.removeVersion(id, versionId)
+      : request(`${API_BASE}/designs/${id}/versions/${versionId}`, { method: "DELETE" }),
   /** Which backend image session (POST /api/sessions) belongs to this design, if it is still alive. */
   getSession: (id: string): Promise<string | null> =>
     USE_MOCKS ? mockDesigns.getSession(id) : get<{ sid: string | null }>(`/designs/${id}/session`).then((r) => r.sid),
@@ -126,7 +167,7 @@ const SERVER_ACTION: Record<AiAction, string> = {
   preview: "single_layer",
   final: "multi_colour",
   area_edit: "multi_colour",
-  watermark: "single_layer",
+  watermark: "multi_colour",                 // gpt-image-2.5-sunburst
   resize_fill: "multi_colour",
 };
 
@@ -136,8 +177,11 @@ export const billingApi = {
   usage: (): Promise<LedgerEntry[]> => (USE_MOCKS ? mockBilling.usage() : get("/billing/usage")),
   invoices: (): Promise<Invoice[]> => (USE_MOCKS ? mockBilling.invoices() : get("/billing/invoices")),
   members: (): Promise<Member[]> => (USE_MOCKS ? mockBilling.members() : get("/team")),
-  invite: (phone: string, name: string) =>
-    USE_MOCKS ? mockBilling.invite(phone, name) : post("/team/invite", { phone, full_name: name }),
+  /** Adds a designer with the password the owner chose, and returns a one-time login link to share. */
+  invite: (phone: string, name: string, password: string): Promise<InviteLink & { temp_password?: string }> =>
+    USE_MOCKS ? demoOnly() : post("/team/invite", { phone, full_name: name, password }),
+  /** A new one-time login link for a designer (the old one stops working). */
+  inviteLink: (userId: string): Promise<InviteLink> => (USE_MOCKS ? demoOnly() : post(`/team/${userId}/invite-link`)),
   removeMember: (userId: string) =>
     USE_MOCKS ? mockBilling.removeMember(userId) : request(`${API_BASE}/team/${userId}`, { method: "DELETE" }),
   changePlan: (planId: PlanId, period: "monthly" | "yearly") =>

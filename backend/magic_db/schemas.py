@@ -153,7 +153,24 @@ class TopUpIn(BaseModel):
 class InviteIn(BaseModel):
     phone: str
     full_name: Optional[str] = None
-    password: Optional[str] = Field(None, max_length=200)           # empty = a temporary one is made
+    password: Optional[str] = Field(None, max_length=200)           # set by the owner; empty = a temporary one
+
+
+class GoogleIn(BaseModel):
+    credential: str = Field(..., max_length=5000)                   # the ID token from the Google button
+
+
+class GoogleCompleteIn(BaseModel):
+    signup_token: str = Field(..., max_length=3000)                 # from POST /auth/google
+    phone: str
+    company_name: str = Field(..., min_length=1, max_length=200)
+    owner_name: Optional[str] = Field(None, max_length=120)
+    city: Optional[str] = Field(None, max_length=100)
+    gstin: Optional[str] = None
+
+
+class InviteCodeIn(BaseModel):
+    code: str = Field(..., max_length=40)                           # from the login link, e.g. ABCDE-FGH23
 
 
 class ReserveIn(BaseModel):

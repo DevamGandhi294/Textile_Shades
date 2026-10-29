@@ -16,7 +16,7 @@ export function currentOf(d: Design) {
 export function DesignCard({ design, partyName }: { design: Design; partyName?: string }) {
   const raw = rawOf(design);
   const cur = currentOf(design);
-  const outlineNo = design.versions.filter((v) => v.kind === "outline").length;
+  const results = design.versions.filter((v) => v.kind === "outline" || v.kind === "ai"); // outlines and AI results
   const size = sizeLabel(cur?.width_mm, cur?.height_mm);
   return (
     <Link
@@ -25,13 +25,13 @@ export function DesignCard({ design, partyName }: { design: Design; partyName?: 
     >
       <div className="grid grid-cols-2 gap-2">
         <Thumb src={raw?.image_url} label="Raw" />
-        <Thumb src={cur && cur.kind !== "raw" ? cur.image_url : undefined} label="Outline" />
+        <Thumb src={cur && cur.kind !== "raw" && cur.kind !== "scan" ? cur.image_url : undefined} label="Result" />
       </div>
       <p className="mt-3 truncate font-medium group-hover:text-accent-ink">{design.name}</p>
       <p className="mt-0.5 truncate text-xs text-muted">
         {[
           partyName,
-          outlineNo ? `v${outlineNo}` : "No outline yet",
+          results.length ? `${cur && cur.kind !== "raw" && cur.kind !== "scan" ? cur.label : "Result"} · ${results.length} result${results.length === 1 ? "" : "s"}` : "No result yet",
           size,
           `${design.chat_count} chat${design.chat_count === 1 ? "" : "s"}`,
           shortAgo(design.updated_at),

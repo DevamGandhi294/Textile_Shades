@@ -8,6 +8,10 @@
 //   POST /api/sessions/{id}/ai-analyse  {machine}  -> AI layers step 1: the plan (cheap)
 //   POST /api/sessions/{id}/ai-layers   -> one AI picture per layer of the plan (paid)
 //   GET  /api/sessions/{id}/ai-layers   ?hidden=0,2  -> the AI layers and a preview (free)
+//   POST /api/sessions/{id}/ai-layers/save  {version_id}  -> keep every layer with a saved design version
+//   GET  /api/versions/{id}/layers.psd  -> the PSD of a saved version's layers (any time later)
+//   POST /api/versions/{id}/transform   {flip_h, flip_v, mirror_half, width_cm, height_cm, fill, dpi} -> picture (free)
+//   POST /api/versions/{id}/remove-watermark  -> picture without watermarks or text (paid)
 //   GET  /api/sessions/{id}/download    ?fmt=...
 //   GET  /api/health
 
@@ -136,6 +140,25 @@ export interface AiLayersState {
   layers?: { id: number; name: string }[];
 }
 
+/** Free edits of a saved result (Python, no AI). Same fields as TransformIn in backend/api.py. */
+export interface TransformInput {
+  flip_h?: boolean;
+  flip_v?: boolean;
+  mirror_half?: boolean;
+  width_cm?: number; // 0 = keep
+  height_cm?: number; // 0 = keep the shape
+  fill?: "repeat" | "stretch" | "fit"; // how a new shape is filled when both sizes are given
+  dpi?: number;
+}
+
+export interface EditedPicture {
+  image: string; // data URL (PNG)
+  width_px: number;
+  height_px: number;
+  dpi?: number | null;
+  model?: string;
+}
+
 export const MAX_CHAT_CHARS = 300;
 
 export const outlineApi = {
@@ -169,35 +192,53 @@ export const outlineApi = {
   aiLayers: (sid: string, hidden: number[] = []) =>
     request<AiLayersState>(`${API_BASE}/sessions/${sid}/ai-layers?hidden=${hidden.join(",")}`),
 
+  /** Keep every AI layer with a saved design version, so its PSD can be made again after the session ends. */
+  aiSave: (sid: string, versionId: string) =>
+    request<{ ok: boolean; layers: number }>(`${API_BASE}/sessions/${sid}/ai-layers/save`, jsonBody({ version_id: versionId })),
+
+  /** Flip, mirror half, new size, fill by repeating: a new picture from a saved result (free). */
+  transform: (versionId: string, body: TransformInput) =>
+    request<EditedPicture>(`${API_BASE}/versions/${versionId}/transform`, jsonBody(body)),
+
+  /** The AI removes watermarks and text from a saved result, nothing else (paid). */
+  removeWatermark: (versionId: string) =>
+    request<EditedPicture>(`${API_BASE}/versions/${versionId}/remove-watermark`, { method: "POST" }),
+
+  /** The PSD of a saved version's layers (no image session needed). */
+  savedLayersPsd: (versionId: string) => saveFile(`${API_BASE}/versions/${versionId}/layers.psd`, "ai_layers.psd"),
+
   downloadUrl: (sid: string, fmt: ExportFormat) =>
     `${API_BASE}/sessions/${sid}/download?fmt=${encodeURIComponent(fmt)}`,
 
   /** Fetches the file and saves it with the name the server gives. */
-  async download(sid: string, fmt: ExportFormat) {
-    const res = await fetch(this.downloadUrl(sid, fmt));
-    if (!res.ok) {
-      let msg = `Download failed (${res.status}).`;
-      try {
-        const d = (await res.json())?.detail;
-        if (typeof d === "string") msg = d;
-      } catch {
-        /* not JSON */
-      }
-      throw new ApiError(res.status, msg);
-    }
-    const name =
-      /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(res.headers.get("content-disposition") ?? "")?.[1] ??
-      `outline.${fmt}`;
-    const url = URL.createObjectURL(await res.blob());
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = decodeURIComponent(name);
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  download(sid: string, fmt: ExportFormat) {
+    return saveFile(this.downloadUrl(sid, fmt), `outline.${fmt}`);
   },
 };
+
+/** Fetches a file from the backend and saves it with the name the server gives. */
+async function saveFile(path: string, fallbackName: string) {
+  const res = await fetch(path);
+  if (!res.ok) {
+    let msg = `Download failed (${res.status}).`;
+    try {
+      const d = (await res.json())?.detail;
+      if (typeof d === "string") msg = d;
+    } catch {
+      /* not JSON */
+    }
+    throw new ApiError(res.status, msg);
+  }
+  const name = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(res.headers.get("content-disposition") ?? "")?.[1] ?? fallbackName;
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = decodeURIComponent(name);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
 
 /** The session lives in the backend's memory for an hour; 404 means upload again. */
 export function isExpired(e: unknown) {

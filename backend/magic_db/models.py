@@ -63,6 +63,7 @@ class User(Base):
     email: Mapped[Optional[str]] = mapped_column(Text, unique=True)
     full_name: Mapped[Optional[str]] = mapped_column(Text)
     password_hash: Mapped[Optional[str]] = mapped_column(Text)       # scrypt; NULL = no password set yet
+    google_sub: Mapped[Optional[str]] = mapped_column(Text, unique=True)  # Google login: Google's id for the person
     failed_logins: Mapped[int] = mapped_column(Integer, server_default="0", default=0)
     locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = created_at()
@@ -102,6 +103,20 @@ class LoginSession(Base):                                 # one row per logged-i
     created_at: Mapped[datetime] = created_at()
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class TeamInvite(Base):                                   # one-time login link for a designer
+    __tablename__ = "team_invites"
+    id: Mapped[uuid.UUID] = uuid_pk()
+    account_id: Mapped[uuid.UUID] = account_fk()
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    code_hash: Mapped[str] = mapped_column(Text, unique=True)           # never store the plain code
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True),
+                                                            ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = created_at()
+    __table_args__ = (Index("ix_team_invites_account_user", "account_id", "user_id"),)
 
 
 # ------------------------------------------------------------------ plans, credits, billing

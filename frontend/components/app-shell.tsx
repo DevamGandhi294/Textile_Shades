@@ -1,7 +1,7 @@
 "use client";
 
 import { useQueryClient } from "@tanstack/react-query";
-import { CreditCard, FolderKanban, LayoutDashboard, LogOut, MessagesSquare, Menu, Users, X } from "lucide-react";
+import { CreditCard, FolderKanban, LayoutDashboard, LogOut, MessagesSquare, Menu, RefreshCw, Users, WifiOff, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -26,6 +26,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = useState(false);
   const me = useMe();
   const loggedOut = me.error instanceof ApiError && me.error.status === 401;
+  // the server could not be reached (or failed): the app stays usable and says so, instead of a blank page
+  const offline = !!me.error && !loggedOut;
   const billing = useBilling();
   const credits = billing.data?.credits;
   const low = credits && credits.balance <= credits.warn_at;
@@ -79,9 +81,21 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         className={cn("m-3 rounded-xl border border-line bg-canvas px-4 py-3", low && "border-amber-200 bg-amber-50")}
       >
         <p className="text-xs text-muted">Credits left</p>
-        <p className={cn("text-2xl font-semibold tabular-nums", low && "text-warn")}>{credits ? credits.balance : "–"}</p>
+        {credits ? (
+          <p className={cn("text-2xl font-semibold tabular-nums", low && "text-warn")}>{credits.balance}</p>
+        ) : billing.isLoading ? (
+          <Skeleton className="mt-1 h-7 w-16" />
+        ) : (
+          <p className="text-2xl font-semibold text-muted">–</p>
+        )}
         {USE_MOCKS && <p className="mt-1 text-[11px] text-muted">Demo data</p>}
       </Link>
+      {me.isLoading && (
+        <div className="mx-3 mb-3 space-y-1.5 border-t border-line pt-3">
+          <Skeleton className="h-4 w-28" />
+          <Skeleton className="h-3 w-20" />
+        </div>
+      )}
       {me.data && (
         <div className="mx-3 mb-3 flex items-center gap-2 border-t border-line pt-3">
           <div className="min-w-0 flex-1">
@@ -96,13 +110,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     </>
   );
 
-  if (loggedOut || (me.isLoading && !me.data)) {
-    return (
-      <div className="p-6">
-        <Skeleton className="h-[70vh]" />
-      </div>
-    );
-  }
+
 
   return (
     <div className="flex min-h-screen">
@@ -130,7 +138,24 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       )}
 
-      <main className="min-w-0 flex-1 pt-12 lg:pt-0">{children}</main>
+      <main className="min-w-0 flex-1 pt-12 lg:pt-0">
+        {offline && (
+          <div role="alert" className="flex flex-wrap items-center gap-2 border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-warn">
+            <WifiOff className="h-4 w-4 shrink-0" />
+            <span className="flex-1">Cannot reach the server. Check your internet, then try again.</span>
+            <button onClick={() => client.invalidateQueries()} className="flex items-center gap-1 font-medium hover:underline">
+              <RefreshCw className="h-3.5 w-3.5" /> Try again
+            </button>
+          </div>
+        )}
+        {loggedOut ? (
+          <div className="p-6">
+            <Skeleton className="h-[70vh]" />
+          </div>
+        ) : (
+          children
+        )}
+      </main>
     </div>
   );
 }
