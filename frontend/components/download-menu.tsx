@@ -25,7 +25,8 @@ const AI: Item[] = [
   { fmt: "perfect", label: "AI outline (PNG)", hint: "Transparent, one layer" },
   { fmt: "perfect-psd", label: "AI outline + colour layers (PSD)", hint: "Photoshop" },
 ];
-const AI_LAYERS: Item = { fmt: "ai-layers-psd", label: "AI layers (PSD)", hint: "Outline layer per object" };
+const AI_LAYERS: Item = { fmt: "ai-layers-psd", label: "AI layers (PSD)", hint: "Outline layer per colour" };
+const AI_LAYERS_SVG: Item = { fmt: "ai-layers-svg", label: "AI layers (SVG)", hint: "Vector, a group per colour" };
 const LAYERS: Item[] = [
   { fmt: "layers-psd", label: "Colour layers (PSD)", hint: "One layer per colour" },
   { fmt: "layers-svg", label: "Colour layers (SVG)", hint: "One group per colour" },
@@ -125,6 +126,7 @@ export function DownloadMenu({
         <DropdownSeparator />
         {AI.map((i) => row(i, !!sid && !!hasPerfect))}
         {row(AI_LAYERS, !!layersVersionId || (!!sid && !!hasAiLayers))}
+        {row(AI_LAYERS_SVG, !!sid && !!hasAiLayers)}
         {LAYERS.map((i) => row(i, !!sid && !!hasLayers))}
         <DropdownSeparator />
         {row({ fmt: "zip", label: "Everything (ZIP)", hint: "All files" }, !!sid)}

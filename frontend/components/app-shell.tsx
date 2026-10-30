@@ -1,12 +1,13 @@
 "use client";
 
 import { useQueryClient } from "@tanstack/react-query";
-import { CreditCard, FolderKanban, LayoutDashboard, LogOut, MessagesSquare, Menu, RefreshCw, Users, WifiOff, X } from "lucide-react";
+import { CreditCard, FolderKanban, LayoutDashboard, Loader2, LogOut, MessagesSquare, Menu, RefreshCw, Users, WifiOff, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { ApiError, USE_MOCKS } from "@/lib/api/client";
 import { authApi } from "@/lib/api/data";
+import { jobLabel, useJobs } from "@/lib/jobs";
 import { useBilling, useMe } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 import { Skeleton } from "./ui/primitives";
@@ -148,6 +149,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </button>
           </div>
         )}
+        <RunningJobs path={path} />
         {loggedOut ? (
           <div className="p-6">
             <Skeleton className="h-[70vh]" />
@@ -156,6 +158,27 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           children
         )}
       </main>
+    </div>
+  );
+}
+
+/** Jobs still running for a design whose page is not open: they go on, and finish with a message. */
+function RunningJobs({ path }: { path: string }) {
+  const jobs = Object.values(useJobs()).filter((j) => j.href !== path);
+  if (!jobs.length) return null;
+  return (
+    <div className="space-y-1 border-b border-line bg-accent-soft px-4 py-2 text-sm text-accent-ink">
+      {jobs.map((j) => (
+        <div key={j.key} className="flex items-center gap-2">
+          <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+          <span className="min-w-0 flex-1 truncate">
+            {jobLabel(j.what)} for <b>{j.title}</b>… it goes on while you work here.
+          </span>
+          <Link href={j.href} className="font-medium hover:underline">
+            Open
+          </Link>
+        </div>
+      ))}
     </div>
   );
 }

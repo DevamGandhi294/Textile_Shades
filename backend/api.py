@@ -13,13 +13,13 @@ uploaded image; the Session is kept in memory so a settings change only re-runs 
     POST /api/sessions/{id}/chat        {message}  -> ask for a change in words (image edits only)
     POST /api/sessions/{id}/layers      {colors, merge, hidden} -> colour layers read from the photo (free, offline)
     POST /api/sessions/{id}/ai-analyse  {machine} -> AI layers step 1: what the design is and which layers (cheap)
-    POST /api/sessions/{id}/ai-layers   AI layers steps 2-3: one image call, cut into layers (paid; see README)
+    POST /api/sessions/{id}/ai-layers   AI layers steps 2-3: one AI clean copy, a border layer per colour (paid)
     GET  /api/sessions/{id}/ai-layers   the AI layers made so far, with a preview (free)
     POST /api/sessions/{id}/ai-layers/save  {version_id} -> keep every AI layer with a saved design version (login)
     GET  /api/versions/{id}/layers.psd  the PSD of a saved version's layers, any time later (login)
     POST /api/versions/{id}/transform   flip, mirror half, size in cm, fill by repeating (free, Python; login)
     POST /api/versions/{id}/remove-watermark  the AI removes watermarks and text only (paid; login)
-    GET  /api/sessions/{id}/download    ?fmt=zip|png|pdf|svg|eps|dxf|tiff|bmp|perfect|layers-svg|layers-zip|layers-psd|perfect-psd|ai-layers-psd
+    GET  /api/sessions/{id}/download    ?fmt=zip|png|pdf|svg|eps|dxf|tiff|bmp|perfect|layers-svg|layers-zip|layers-psd|perfect-psd|ai-layers-psd|ai-layers-svg
     GET  /api/health
 
 Database part (magic_db/, PostgreSQL): login, team, parties, designs and their versions, chats, credits,
@@ -49,7 +49,7 @@ import cv2
 import numpy as np
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
@@ -336,6 +336,13 @@ app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["*"], a
 magic_db.setup(app)                               # login, parties, designs, chats, credits (PostgreSQL)
 
 
+@app.exception_handler(Exception)
+async def _unexpected(request, exc):
+    """A bug: written to the log with its traceback (outputs/server.log when run with python api.py)."""
+    log.error("unexpected error in %s %s", request.method, request.url.path, exc_info=exc)
+    return JSONResponse({"detail": "Something went wrong on the server. Please try again."}, status_code=500)
+
+
 @app.get("/api/health", tags=["Health"])
 def health():
     return {"ok": True, "ai": ai.available(), "ai_status": ai.status(), "perfect": perfect.available(),
@@ -569,6 +576,16 @@ def _ai_runs(entry):
     return {"used": entry.ai_runs, "limit": _env_int("AI_LAYERS_MAX_RUNS_PER_SESSION", 2)}
 
 
+def _photo(path):
+    """The uploaded photo, read again from its file (RGB). If the file is gone, the picture is treated as expired
+    (404): the website then uploads it again by itself and repeats the request."""
+    try:
+        return load_rgb(path)
+    except OSError:
+        log.warning("the uploaded photo %s is missing; asking the website to upload it again", path)
+        raise HTTPException(404, "This picture has expired. Please upload it again.")
+
+
 def _ai_json(entry, hidden=()):
     """The AI layers state for the website: the plan, the runs used and, when made, a preview and the layer list."""
     out = {"plan": entry.ai_plan, "runs": _ai_runs(entry), "made": entry.ai_layers is not None}
@@ -576,6 +593,8 @@ def _ai_json(entry, hidden=()):
     if ai:
         out["image"] = _data_url(layer_pipeline.composite(ai["layers"], ai["plan"]["mirror"], set(hidden)))
         out["layers"] = [{"id": i, "name": name} for i, (name, _) in enumerate(ai["layers"])]
+        out["drawing"] = ai.get("drawing")          # the AI's clean flat-colour copy of the design
+        out["borders"] = ai.get("borders")          # all the border layers together, in one picture
     return out
 
 
@@ -602,9 +621,10 @@ def ai_analyse(sid: str, body: AnalyseIn, authorization: Optional[str] = Header(
     see how many image calls the layers will need before any of them is paid. Needs API_TOKEN (if set)."""
     _require_token(authorization)
     entry = _get(sid)
+    photo = _photo(entry.sess.path)              # before anything is counted
     stamp = _take_chat_slot(entry)
     try:
-        analysis, meta = layer_pipeline.analyse_image(load_rgb(entry.sess.path), body.machine)
+        analysis, meta = layer_pipeline.analyse_image(photo, body.machine)
     except layer_pipeline.PipelineError as e:
         with entry.lock:
             entry.chat_calls -= 1                 # nothing was answered, so the slot is given back
@@ -621,9 +641,10 @@ def ai_analyse(sid: str, body: AnalyseIn, authorization: Optional[str] = Header(
 
 @app.post("/api/sessions/{sid}/ai-layers", tags=["Image: AI layers"])
 def make_ai_layers(sid: str, authorization: Optional[str] = Header(None)):
-    """AI layers, steps 2 to 3: ONE image call traces the whole design (with the model chosen for the plan), and
-    the outlines are cut into the plan's layers by the photo's colours, so the layers always line up. It counts once
-    in the hourly image limit; the runs per photo are limited (AI_LAYERS_MAX_RUNS_PER_SESSION). Needs API_TOKEN."""
+    """AI layers, steps 2 to 3: ONE image call makes a clean flat-colour copy of the design (with the model chosen
+    for the plan), and a thin closed border is drawn around every colour area of it, one layer per colour, so the
+    layers sit on each other pixel for pixel. It counts once in the hourly image limit; the runs per photo are
+    limited (AI_LAYERS_MAX_RUNS_PER_SESSION). Needs API_TOKEN (if set)."""
     _require_token(authorization)
     entry = _get(sid)
     limit = _env_int("AI_LAYERS_MAX_RUNS_PER_SESSION", 2)
@@ -634,13 +655,19 @@ def make_ai_layers(sid: str, authorization: Optional[str] = Header(None)):
             raise HTTPException(429, f"The AI layers can be made {limit} times per photo. Upload the photo again to try more.")
         entry.ai_runs += 1
         plan, path = dict(entry.ai_plan), entry.sess.path
-    stamp = _reserve_hourly()                    # one image call for all the layers
+    try:
+        photo = _photo(path)
+    except HTTPException:
+        with entry.lock:
+            entry.ai_runs -= 1                    # nothing was tried: the run is not counted
+        raise
+    stamp = _reserve_hourly()                    # ONE image call for all the layers
     if stamp is None:
         with entry.lock:
             entry.ai_runs -= 1
         raise HTTPException(429, "The AI layers have been used too often in the last hour. Please try again later.")
     try:
-        made = layer_pipeline.generate_all(load_rgb(path), plan)
+        made = layer_pipeline.generate_all(photo, plan)
     except layer_pipeline.PipelineError as e:
         _release_hourly(stamp)                    # nothing was made: not paid, the run is not counted
         with entry.lock:
@@ -659,7 +686,12 @@ def make_ai_layers(sid: str, authorization: Optional[str] = Header(None)):
             raise HTTPException(404, "This picture has expired. Please upload it again.")
         h, w = made["layers"][0][1].shape[:2]     # the background colour is one solid layer at the bottom (free)
         bg = ("Background colour", layer_pipeline.background_layer(plan, (w, h)))
-        entry.ai_layers = {"plan": plan, "layers": [bg] + list(made["layers"])}
+        entry.ai_layers = {
+            "plan": plan,
+            "layers": [bg] + list(made["layers"]),
+            "drawing": _data_url(layer_pipeline.composite([("AI outline", made["copy"])], plan["mirror"])),
+            "borders": _data_url(layer_pipeline.composite(list(made["layers"]), plan["mirror"])),  # one picture
+        }
     return _ai_json(entry)
 
 
@@ -677,11 +709,14 @@ class SaveLayersIn(BaseModel):
     version_id: str
 
 
-def _layer_colour(name, plan):
+def _layer_colour(name, rgba, plan):
     """The colour a layer was drawn in (shown as the layer's colour in the design's history)."""
     if name == "Background colour":
         return plan.get("background_color") or "#ffffff"
-    return next((l["border_color"] for l in plan["layers"] if l["name"] == name), layer_pipeline.LINE_BORDER_COLOUR)
+    on = rgba[..., 3] > 127
+    if not on.any():
+        return layer_pipeline.LINE_BORDER_COLOUR
+    return "#%02x%02x%02x" % tuple(int(v) for v in np.median(rgba[..., :3][on], axis=0))
 
 
 @app.post("/api/sessions/{sid}/ai-layers/save", tags=["Image: AI layers"])
@@ -700,7 +735,7 @@ def save_ai_layers(sid: str, body: SaveLayersIn, cur: Current = Depends(current)
     for pos, (name, rgba) in enumerate(made, start=1):
         page = layer_pipeline._full_width(rgba, plan["mirror"])        # a mirrored design is saved whole
         ok, png = cv2.imencode(".png", cv2.cvtColor(page, cv2.COLOR_RGBA2BGRA))
-        files.append((pos, name, png.tobytes()))
+        files.append((pos, name, png.tobytes(), _layer_colour(name, rgba, plan)))
     db_credits.check_storage(db, cur.account_id, sum(len(f[2]) for f in files))
 
     base = v.storage_key.rsplit("/", 1)[0] + "/layers"                 # next to the version's own image
@@ -708,12 +743,12 @@ def save_ai_layers(sid: str, body: SaveLayersIn, cur: Current = Depends(current)
     for row in old:
         db.delete(row)
     keys = []
-    for pos, name, png in files:
+    for pos, name, png, colour in files:
         key = f"{base}/{pos:02d}.png"
         db_storage.put(key, png, "image/png")
         keys.append(key)
         db.add(VersionLayer(account_id=cur.account_id, version_id=v.id, position=pos, name=name,
-                            color=_layer_colour(name, plan), visible=True, mask_key=key))
+                            color=colour, visible=True, mask_key=key))
     v.size_bytes = (v.size_bytes or 0) + sum(len(f[2]) for f in files)
     db.commit()
     db_storage.delete(*[r.mask_key for r in old if r.mask_key and r.mask_key not in keys])
@@ -876,9 +911,10 @@ def remove_watermark(version_id: str, cur: Current = Depends(current), db: DbSes
             "model": meta.get("model"), "quality": meta.get("quality")}
 
 
-def _download_ai_layers(entry):
+def _download_ai_layers(entry, fmt="ai-layers-psd"):
     """ai-layers-psd: ONE PSD with a named layer per AI layer (bottom to top), a white background and the
-    original photo as a hidden layer. A symmetric design is mirrored here."""
+    original photo as a hidden layer. ai-layers-svg: the same layers as vector shapes in one SVG, a group per
+    layer. A symmetric design is mirrored here."""
     with entry.lock:
         ai = entry.ai_layers
         if ai is None:
@@ -891,9 +927,20 @@ def _download_ai_layers(entry):
         folder = entry.folder / "layers"
         shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir(parents=True)
+        if fmt == "ai-layers-svg":
+            path = folder / f"{entry.stem}_ai_layers.svg"
+            try:
+                layer_pipeline.export_svg(path, ai["layers"], mirror, ai["plan"].get("background_color") or "#ffffff")
+            except layer_pipeline.PipelineError as e:
+                raise HTTPException(400, str(e))
+            return FileResponse(path, filename=path.name, media_type="image/svg+xml")
         path = folder / f"{entry.stem}_ai_layers.psd"
         try:
-            layer_pipeline.export_psd(path, ai["layers"], mirror, dpi, reference=load_rgb(sess.path))
+            try:
+                reference = load_rgb(sess.path)
+            except OSError:
+                reference = None                  # the photo file is gone: the PSD is made without it
+            layer_pipeline.export_psd(path, ai["layers"], mirror, dpi, reference=reference)
         except layer_pipeline.PipelineError as e:
             raise HTTPException(400, str(e))
         return FileResponse(path, filename=path.name, media_type="image/vnd.adobe.photoshop")
@@ -974,8 +1021,8 @@ def download(sid: str, fmt: str = "zip"):
         if entry.perfect is None or not entry.perfect.exists():
             raise HTTPException(404, "Press Make border perfect first.")
         return FileResponse(entry.perfect, filename=entry.perfect.name)
-    if fmt == "ai-layers-psd":
-        return _download_ai_layers(entry)
+    if fmt in ("ai-layers-psd", "ai-layers-svg"):
+        return _download_ai_layers(entry, fmt)
     if fmt == "perfect-psd":
         return _download_perfect_psd(entry)
     if fmt in ("layers-svg", "layers-zip", "layers-psd"):
@@ -1010,4 +1057,9 @@ if __name__ == "__main__":
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
     a = ap.parse_args()
+    # errors also go to a file, so they can be read even when the server runs without a window
+    (HERE / "outputs").mkdir(exist_ok=True)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        handlers=[logging.StreamHandler(),
+                                  logging.FileHandler(HERE / "outputs" / "server.log", encoding="utf-8")])
     uvicorn.run(app, host=a.host, port=a.port)

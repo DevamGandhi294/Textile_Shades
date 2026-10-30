@@ -40,3 +40,47 @@ body {
   background-size: 16px 16px;
   background-position: 0 0, 0 8px, 8px -8px, -8px 0;
 }
+
+/* AI scanner over the photo (while the AI works): a pane of frosted glass glides down; everything it has passed
+   over turns into crisp grey line work on a fine grid, as if the AI is reading it; then it fades and starts again.
+   The glass, the line work and the grid share one timing, so the edge of the "read" part is always the glass. */
+.scan-line {
+  height: 56px;
+  top: -56px;
+  background:
+    radial-gradient(circle, color-mix(in srgb, var(--color-accent) 55%, transparent) 0.8px, transparent 1.4px) 0 0 / 12px 12px,
+    linear-gradient(to bottom, rgb(255 255 255 / 0.06), rgb(255 255 255 / 0.32));
+  backdrop-filter: blur(4px) saturate(1.2);
+  -webkit-backdrop-filter: blur(4px) saturate(1.2);
+  border-top: 1px solid rgb(255 255 255 / 0.5);
+  border-bottom: 2px solid color-mix(in srgb, var(--color-accent) 70%, white);
+  box-shadow:
+    0 6px 18px -6px color-mix(in srgb, var(--color-accent) 45%, transparent),
+    0 -8px 24px -14px rgb(15 23 42 / 0.25);
+  animation: scan-sweep 3.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+.scan-reveal {
+  filter: grayscale(1) contrast(2) brightness(1.08);
+  animation: scan-reveal 3.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+.scan-grid {
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--color-accent) 10%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--color-accent) 10%, transparent) 1px, transparent 1px);
+  background-size: 24px 24px;
+  animation: scan-reveal 3.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@keyframes scan-sweep {
+  0% { top: -56px; opacity: 1; }
+  80% { top: 100%; opacity: 1; }
+  100% { top: 100%; opacity: 0; }
+}
+@keyframes scan-reveal {
+  0% { clip-path: inset(0 0 100% 0); opacity: 1; }
+  80% { clip-path: inset(0 0 0 0); opacity: 1; }
+  100% { clip-path: inset(0 0 0 0); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .scan-line { animation: none; top: calc(50% - 28px); }
+  .scan-reveal, .scan-grid { animation: none; clip-path: inset(0 0 50% 0); }
+}

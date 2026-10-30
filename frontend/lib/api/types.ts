@@ -86,7 +86,7 @@ export interface Invoice {
   issued_at: string;
 }
 
-export type AiAction = "preview" | "final" | "area_edit" | "watermark" | "resize_fill";
+export type AiAction = "preview" | "final" | "area_edit" | "watermark" | "resize_fill" | "layer_hd";
 
 /** Credits per action (Account and billing → "What uses credits"). */
 // As backend/magic_db/config.py CREDIT_COST charges them (see SERVER_ACTION in lib/api/data.ts).
@@ -96,6 +96,7 @@ export const CREDIT_COST: Record<AiAction, number> = {
   area_edit: 3,
   watermark: 3,
   resize_fill: 3,
+  layer_hd: 9, // one AI layer picture at high quality
 };
 
 // ------------------------------------------------------------------ parties
@@ -196,7 +197,8 @@ export type ExportFormat =
   | "layers-psd"
   | "layers-svg"
   | "layers-zip"
-  | "ai-layers-psd";
+  | "ai-layers-psd"
+  | "ai-layers-svg";
 
 // ------------------------------------------------------------------ chats
 

@@ -10,6 +10,7 @@ import { billingApi, chatsApi, designsApi, type NewVersion } from "@/lib/api/dat
 import { DEFAULT_SETTINGS, outlineApi, type EditedPicture, type OutlineSettings } from "@/lib/api/outline";
 import { CREDIT_COST, type Design, type DesignVersion } from "@/lib/api/types";
 import { storableCopy } from "@/lib/image";
+import { useBusy, useJobs } from "@/lib/jobs";
 import { takePendingUpload } from "@/lib/pending-upload";
 import { useDesign, useDesignChats, useHealth, useParty, useRefreshAll } from "@/lib/queries";
 import { cn, shortDate, sizeLabel } from "@/lib/utils";
@@ -24,7 +25,7 @@ import { useOutlineSession } from "./use-outline-session";
 
 const IMAGE_TYPES = ".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff";
 // what is shown next to the raw photo (Before / After is the only full-width view)
-type View = "scan" | "compare" | "result" | "check" | "layers" | "ailayers";
+type View = "scan" | "compare" | "result" | "check" | "layers" | "aidrawing" | "aiborders" | "ailayers";
 
 function baseVersion(kind: DesignVersion["kind"]): NewVersion {
   return {
@@ -73,11 +74,18 @@ export function Workspace({ designId }: { designId: string }) {
   }, [initial]);
 
   const session = useOutlineSession(design.data, settings);
-  const [busy, setBusy] = useState<string | null>(null);
+  // kept for the whole app: a job goes on (and shows as running) when another page is opened and this one again
+  const href = `/workspace/${designId}`;
+  const [busy, setBusy] = useBusy(designId, design.data?.name ?? "Design", href);
   const [view, setView] = useState<View>("result");
   const [shownId, setShownId] = useState<string | null>(null);
   const [layerImg, setLayerImg] = useState<string | null>(null);
-  const [aiImg, setAiImg] = useState<string | null>(null); // AI layers preview
+  const [aiImg, setAiImg] = useState<string | null>(null); // AI layers preview (Python's layers)
+  const [aiDrawing, setAiDrawing] = useState<string | null>(null); // the AI's clean flat-colour copy
+  const [aiBorders, setAiBorders] = useState<string | null>(null); // all the border layers in one picture
+  const aiJob = useJobs()[`${designId}:ai`]?.what; // the AI is scanning or drawing: scanner over the photo
+  const aiBusy = aiJob === "analyse" || aiJob === "make";
+  const [scanFlash, setScanFlash] = useState(false); // a short scan when the AI layers tab is opened
   const [chatId, setChatId] = useState<string | null>(params.get("chat"));
   const [panel, setPanel] = useState<"settings" | "layers" | "ailayers">("settings");
   const [mobilePane, setMobilePane] = useState<"chat" | "image" | "settings">("image");
@@ -145,6 +153,8 @@ export function Workspace({ designId }: { designId: string }) {
             }, false)
           : null;
         setAiImg(null);
+        setAiDrawing(null);
+        setAiBorders(null);
         const outlineNo = versions.filter((v) => v.kind === "outline").length + 1;
         const lines = r.previews.final ?? r.previews.clean;
         if (!lines) {
@@ -491,6 +501,8 @@ export function Workspace({ designId }: { designId: string }) {
                   <TabsList className="border-b-0">
                     <TabsTrigger value="result">Result</TabsTrigger>
                     <TabsTrigger value="scan" disabled={!scan}>Scanned</TabsTrigger>
+                    {aiDrawing && <TabsTrigger value="aidrawing">AI outline</TabsTrigger>}
+                    {aiBorders && <TabsTrigger value="aiborders">Borders</TabsTrigger>}
                     <TabsTrigger value="ailayers">All layers</TabsTrigger>
                     {layerImg && <TabsTrigger value="layers">Colour layers</TabsTrigger>}
                     {session.result?.previews.check && <TabsTrigger value="check">Check gaps</TabsTrigger>}
@@ -542,7 +554,7 @@ export function Workspace({ designId }: { designId: string }) {
                 )}
                 {view !== "compare" && (
                   <div className="grid flex-1 gap-3 md:grid-cols-2">
-                    <Pane src={raw.image_url} caption={rawCaption(raw)} />
+                    <Pane src={raw.image_url} caption={rawCaption(raw)} scanning={!!aiBusy || scanFlash} />
                     {view === "result" && (
                       <Pane src={shown?.image_url ?? null} caption={shown ? resultCaption(shown) : "No result yet: use Generate, AI layers or Apply settings"} checker />
                     )}
@@ -551,6 +563,12 @@ export function Workspace({ designId }: { designId: string }) {
                       <Pane src={session.result?.previews.check ?? null} caption={`Loose line ends are marked · ${session.result?.info.loose_ends ?? 0} loose ends`} />
                     )}
                     {view === "layers" && <Pane src={layerImg} caption="Colour layers preview" checker />}
+                    {view === "aidrawing" && (
+                      <Pane src={aiDrawing} caption="AI outline · the design traced by ChatGPT as black lines; every shape takes its colour from your photo" />
+                    )}
+                    {view === "aiborders" && (
+                      <Pane src={aiBorders} caption="Borders · every colour area with a thin closed border in its own colour, all layers together" />
+                    )}
                     {view === "ailayers" && (
                       <Pane src={aiImg} caption={aiImg ? "AI layers · outlines only, one colour per layer" : "No AI layers yet: open AI layers on the right"} />
                     )}
@@ -570,7 +588,11 @@ export function Workspace({ designId }: { designId: string }) {
         <aside className={cn("w-full shrink-0 flex-col border-l border-line bg-surface lg:flex lg:w-80", mobilePane === "settings" ? "flex" : "hidden")}>
           <Tabs value={panel} onValueChange={(v) => {
               setPanel(v as typeof panel);
-              if (v === "ailayers") setView("ailayers"); // show the AI layers next to the photo
+              if (v === "ailayers") {
+                setView("ailayers"); // show the AI layers next to the photo
+                setScanFlash(true);
+                setTimeout(() => setScanFlash(false), 2400);
+              }
               else if (v === "layers" && layerImg) setView("layers");
             }} className="flex min-h-0 flex-1 flex-col">
             <TabsList className="px-2">
@@ -609,27 +631,45 @@ export function Workspace({ designId }: { designId: string }) {
             </TabsContent>
             <TabsContent value="ailayers" className="min-h-0 flex-1">
               <AiLayersPanel
+                job={{ key: `${d.id}:ai`, title: d.name, href }}
                 withSession={session.withSession}
                 sid={session.sid}
                 disabled={!raw || offline || !!noAi}
-                reserve={(count) => billingApi.reserve("final", count, "AI layers", party.data?.name ?? null, d.name)}
-                onPreview={(img) => {
+                reserve={(count) => billingApi.reserve("layer_hd", count, "AI layers", party.data?.name ?? null, d.name)}
+                onPreview={(img, copy, borders, jump) => {
                   setAiImg(img);
-                  if (img) setView("ailayers");
+                  setAiDrawing(copy);
+                  setAiBorders(borders);
+                  if (!jump) return; // hiding or showing a layer keeps the tab that is open
+                  if (borders) setView("aiborders");
+                  else if (img) setView("ailayers");
                 }}
                 onMade={async (s, cost) => {
                   // saved like every AI result: it shows in Designs and in the version list here
-                  if (!s.image) return;
+                  const result = s.borders ?? s.image;
+                  if (!result) return;
                   try {
                     const n = versions.filter((v) => v.label.startsWith("AI layers")).length + 1;
+                    const size = { width_px: session.result?.info.width ?? null, height_px: session.result?.info.height ?? null };
+                    // 1. the AI outline (what was paid for), 2. the borders drawn from it, with every layer saved
+                    const drawing = s.drawing
+                      ? await addResultVersion({
+                          kind: "ai",
+                          image_url: s.drawing,
+                          label: n === 1 ? "AI outline" : `AI outline ${n}`,
+                          note: [s.plan?.model, `${cost} cr`].filter(Boolean).join(" · "),
+                          ...size,
+                          credits: cost,
+                        })
+                      : null;
                     const v = await addResultVersion({
                       kind: "ai",
-                      image_url: s.image,
+                      image_url: result,
                       label: n === 1 ? "AI layers" : `AI layers ${n}`,
                       note: [`${s.layers?.length ?? 0} layers`, s.plan?.machine, s.plan?.model].filter(Boolean).join(" · "),
-                      width_px: session.result?.info.width ?? null,
-                      height_px: session.result?.info.height ?? null,
-                      credits: cost,
+                      ...size,
+                      credits: drawing ? 0 : cost,
+                      ...(drawing ? { parent_id: drawing.id } : {}),
                     });
                     setShownId(v.id);
                     if (session.sid) await outlineApi.aiSave(session.sid, v.id); // every layer, for the PSD later
@@ -678,7 +718,7 @@ function changeNote(before: OutlineSettings, after: OutlineSettings): string | n
   return s[0]!.toUpperCase() + s.slice(1);
 }
 
-function Pane({ src, caption, checker }: { src: string | null; caption: string; checker?: boolean }) {
+function Pane({ src, caption, checker, scanning }: { src: string | null; caption: string; checker?: boolean; scanning?: boolean }) {
   return (
     <figure className="flex min-h-[280px] flex-1 flex-col">
       <div className={cn("relative flex-1 overflow-hidden rounded-xl border border-line", checker ? "checker" : "bg-white")}>
@@ -687,6 +727,17 @@ function Pane({ src, caption, checker }: { src: string | null; caption: string; 
           <img src={src} alt={caption} className="absolute inset-0 h-full w-full object-contain p-2" />
         ) : (
           <div className="grid h-full place-items-center text-sm text-muted">Nothing here yet</div>
+        )}
+        {scanning && (
+          <div className="pointer-events-none absolute inset-0" aria-hidden>
+            {/* what the glass has passed over is shown "read": the same photo in crisp grey lines on a fine grid */}
+            {src && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={src} alt="" className="scan-reveal absolute inset-0 h-full w-full object-contain p-2" />
+            )}
+            <div className="scan-grid absolute inset-0" />
+            <div className="scan-line absolute inset-x-0" />
+          </div>
         )}
       </div>
       <figcaption className="mt-2 truncate text-xs text-muted">{caption}</figcaption>

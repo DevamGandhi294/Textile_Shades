@@ -125,7 +125,7 @@ export interface AiPlan {
   image_type: "line" | "color";
   is_complete: boolean;
   is_symmetric: boolean;
-  mirror: boolean; // the left half is drawn and mirrored
+  mirror: boolean; // always false now: the whole design is drawn (a cut half lost its middle)
   background_color: string; // one solid layer at the bottom (no AI call)
   layers: { name: string; description: string; border_color: string }[]; // outlines only, in border_color
   machine: Machine;
@@ -137,6 +137,8 @@ export interface AiLayersState {
   runs: Usage; // how many times the layers were made for this photo
   made: boolean;
   image?: string; // preview of the layers stacked
+  drawing?: string; // the AI's clean flat-colour copy of the design (what the borders are drawn from)
+  borders?: string; // all the border layers together, in one picture: the result
   layers?: { id: number; name: string }[];
 }
 

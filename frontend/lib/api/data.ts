@@ -169,6 +169,7 @@ const SERVER_ACTION: Record<AiAction, string> = {
   area_edit: "multi_colour",
   watermark: "multi_colour",                 // gpt-image-2.5-sunburst
   resize_fill: "multi_colour",
+  layer_hd: "multi_colour_hd",
 };
 
 export const billingApi = {
