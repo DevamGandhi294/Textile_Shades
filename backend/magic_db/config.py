@@ -103,9 +103,9 @@ CREDIT_LABEL = {
     "multi_colour_hd": "Multi-colour HD outline",
     "chat": "Chat edit",
 }
-# 0 = testing: no credit, HD, storage, seat or party limits (usage is still written in the ledger).
-# Keep it on (the default) on a real server.
-BILLING_CHECKS = _bool("BILLING_CHECKS", True)
+# 0 = no credit, HD, storage, seat or party limits (usage is still written in the ledger).
+# TEMPORARILY OFF by default. To turn the limits back on, set BILLING_CHECKS=1 in .env or change False to True.
+BILLING_CHECKS = _bool("BILLING_CHECKS", False)
 TOP_UP_CREDITS = _int("TOP_UP_CREDITS", 50)
 TOP_UP_PRICE_INR = _int("TOP_UP_PRICE_INR", 249)
 HOLD_MINUTES = _int("HOLD_MINUTES", 15)                    # a reserve not settled by then is given back
