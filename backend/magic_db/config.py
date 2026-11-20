@@ -104,8 +104,9 @@ CREDIT_LABEL = {
     "chat": "Chat edit",
 }
 # 0 = no credit, HD, storage, seat or party limits (usage is still written in the ledger).
-# TEMPORARILY OFF by default. To turn the limits back on, set BILLING_CHECKS=1 in .env or change False to True.
-BILLING_CHECKS = _bool("BILLING_CHECKS", False)
+# TEMPORARILY OFF for everyone: the BILLING_CHECKS env setting is ignored.
+# To turn the limits back on, change this line back to:  BILLING_CHECKS = _bool("BILLING_CHECKS", True)
+BILLING_CHECKS = False
 TOP_UP_CREDITS = _int("TOP_UP_CREDITS", 50)
 TOP_UP_PRICE_INR = _int("TOP_UP_PRICE_INR", 249)
 HOLD_MINUTES = _int("HOLD_MINUTES", 15)                    # a reserve not settled by then is given back
